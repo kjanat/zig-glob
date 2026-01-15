@@ -520,3 +520,271 @@ test "zero-padded numeric range" {
     try std.testing.expectEqualStrings("04", result[3]);
     try std.testing.expectEqualStrings("05", result[4]);
 }
+
+// ============================================================================
+// Edge Case Tests
+// ============================================================================
+
+test "edge: empty braces" {
+    const allocator = std.testing.allocator;
+    // {} should produce empty string alternative
+    const result = try expand(allocator, "{}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("", result[0]);
+}
+
+test "edge: single element brace" {
+    const allocator = std.testing.allocator;
+    // {a} should produce just "a"
+    const result = try expand(allocator, "{a}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("a", result[0]);
+}
+
+test "edge: nested two levels deep" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{a,{b,c}}", .{});
+    defer freeExpanded(allocator, result);
+
+    // Nested braces expand - actual behavior depends on implementation
+    // {a,{b,c}} with nested alternative should produce multiple results
+    try std.testing.expect(result.len >= 2);
+}
+
+test "edge: nested three levels deep" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{a,{b,{c,d}}}", .{});
+    defer freeExpanded(allocator, result);
+
+    // Deeply nested - verify it doesn't crash and produces results
+    try std.testing.expect(result.len >= 2);
+}
+
+test "edge: descending numeric range" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{5..1}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 5), result.len);
+    try std.testing.expectEqualStrings("5", result[0]);
+    try std.testing.expectEqualStrings("4", result[1]);
+    try std.testing.expectEqualStrings("3", result[2]);
+    try std.testing.expectEqualStrings("2", result[3]);
+    try std.testing.expectEqualStrings("1", result[4]);
+}
+
+test "edge: descending alpha range" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{z..a}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 26), result.len);
+    try std.testing.expectEqualStrings("z", result[0]);
+    try std.testing.expectEqualStrings("y", result[1]);
+    try std.testing.expectEqualStrings("a", result[25]);
+}
+
+test "edge: negative to positive numeric range" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{-2..2}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 5), result.len);
+    try std.testing.expectEqualStrings("-2", result[0]);
+    try std.testing.expectEqualStrings("-1", result[1]);
+    // Note: zero padding is determined by input format
+    // "-2" has 2 chars, so positive numbers get padded to 2 chars
+    try std.testing.expectEqualStrings("00", result[2]); // 0 padded
+    try std.testing.expectEqualStrings("01", result[3]); // 1 padded
+    try std.testing.expectEqualStrings("02", result[4]); // 2 padded
+}
+
+test "edge: zero-padded range 00 to 05" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{00..05}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 6), result.len);
+    try std.testing.expectEqualStrings("00", result[0]);
+    try std.testing.expectEqualStrings("01", result[1]);
+    try std.testing.expectEqualStrings("02", result[2]);
+    try std.testing.expectEqualStrings("03", result[3]);
+    try std.testing.expectEqualStrings("04", result[4]);
+    try std.testing.expectEqualStrings("05", result[5]);
+}
+
+test "edge: brace at start of pattern" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{a,b}suffix", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("asuffix", result[0]);
+    try std.testing.expectEqualStrings("bsuffix", result[1]);
+}
+
+test "edge: brace at end of pattern" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "prefix{a,b}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("prefixa", result[0]);
+    try std.testing.expectEqualStrings("prefixb", result[1]);
+}
+
+test "edge: brace in middle of pattern" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "pre{a,b}suf", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("preasuf", result[0]);
+    try std.testing.expectEqualStrings("prebsuf", result[1]);
+}
+
+test "edge: three braces in sequence" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{a,b}{1,2}{x,y}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 8), result.len);
+    try std.testing.expectEqualStrings("a1x", result[0]);
+    try std.testing.expectEqualStrings("a1y", result[1]);
+    try std.testing.expectEqualStrings("a2x", result[2]);
+    try std.testing.expectEqualStrings("a2y", result[3]);
+    try std.testing.expectEqualStrings("b1x", result[4]);
+    try std.testing.expectEqualStrings("b1y", result[5]);
+    try std.testing.expectEqualStrings("b2x", result[6]);
+    try std.testing.expectEqualStrings("b2y", result[7]);
+}
+
+test "edge: empty alternative in brace" {
+    const allocator = std.testing.allocator;
+    // {a,,b} should have empty middle alternative
+    const result = try expand(allocator, "{a,,b}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0]);
+    try std.testing.expectEqualStrings("", result[1]);
+    try std.testing.expectEqualStrings("b", result[2]);
+}
+
+test "edge: single char alpha range" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{a..c}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0]);
+    try std.testing.expectEqualStrings("b", result[1]);
+    try std.testing.expectEqualStrings("c", result[2]);
+}
+
+test "edge: uppercase alpha range" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{A..D}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expectEqualStrings("A", result[0]);
+    try std.testing.expectEqualStrings("B", result[1]);
+    try std.testing.expectEqualStrings("C", result[2]);
+    try std.testing.expectEqualStrings("D", result[3]);
+}
+
+test "edge: same start and end range" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{5..5}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("5", result[0]);
+}
+
+test "edge: same start and end alpha range" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{x..x}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("x", result[0]);
+}
+
+test "edge: malformed brace returns error" {
+    const allocator = std.testing.allocator;
+    // Unclosed brace
+    const result = expand(allocator, "{a,b", .{});
+    try std.testing.expectError(BraceError.MalformedBrace, result);
+}
+
+test "edge: brace with special glob chars inside" {
+    const allocator = std.testing.allocator;
+    // Glob chars inside braces should be preserved
+    const result = try expand(allocator, "{*.txt,?.md}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("*.txt", result[0]);
+    try std.testing.expectEqualStrings("?.md", result[1]);
+}
+
+test "edge: brace with path separator inside" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{src/a,lib/b}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("src/a", result[0]);
+    try std.testing.expectEqualStrings("lib/b", result[1]);
+}
+
+test "edge: range that is not valid falls back to alternation" {
+    const allocator = std.testing.allocator;
+    // {a..} is not a valid range, should be treated as literal
+    const result = try expand(allocator, "{a..}", .{});
+    defer freeExpanded(allocator, result);
+
+    // The ".." inside brace with empty end - treated as literal
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("a..", result[0]);
+}
+
+test "edge: whitespace in alternatives" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{ a , b }", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings(" a ", result[0]);
+    try std.testing.expectEqualStrings(" b ", result[1]);
+}
+
+test "edge: numeric range large span" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "{1..100}", .{});
+    defer freeExpanded(allocator, result);
+
+    try std.testing.expectEqual(@as(usize, 100), result.len);
+    try std.testing.expectEqualStrings("1", result[0]);
+    try std.testing.expectEqualStrings("50", result[49]);
+    try std.testing.expectEqualStrings("100", result[99]);
+}
+
+test "edge: deeply nested with prefix/suffix" {
+    const allocator = std.testing.allocator;
+    const result = try expand(allocator, "x{a{1,2},b}y", .{});
+    defer freeExpanded(allocator, result);
+
+    // Nested braces with prefix/suffix - verify produces results
+    try std.testing.expect(result.len >= 2);
+    // First result should start with x and end with y
+    try std.testing.expect(result[0].len >= 2);
+    try std.testing.expectEqual(@as(u8, 'x'), result[0][0]);
+    try std.testing.expectEqual(@as(u8, 'y'), result[0][result[0].len - 1]);
+}

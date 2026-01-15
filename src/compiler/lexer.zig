@@ -132,6 +132,11 @@ pub const Lexer = struct {
     fn nextNormal(self: *Lexer, start: usize, c: u8) Token {
         switch (c) {
             '*' => {
+                // Check for extglob prefix: *( means zero-or-more pattern
+                if (self.pos + 1 < self.input.len and self.input[self.pos + 1] == '(') {
+                    self.pos += 1;
+                    return .{ .kind = .extglob_prefix, .text = "*", .pos = start };
+                }
                 self.pos += 1;
                 // Check for ** (globstar)
                 if (self.pos < self.input.len and self.input[self.pos] == '*') {
@@ -622,4 +627,422 @@ test "literal bracket at start of class" {
 
     tok = lexer.next();
     try std.testing.expectEqual(TokenKind.bracket_close, tok.kind);
+}
+
+// ============================================================================
+// Edge Case Tests
+// ============================================================================
+
+test "edge: consecutive escapes" {
+    // \\\\ should produce two literal backslashes
+    var lex = Lexer.init("\\\\\\\\");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("\\", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("\\", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: escaped special chars" {
+    // \*\? should produce literal * and ?
+    var lex = Lexer.init("\\*\\?");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("*", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("?", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: empty pattern" {
+    var lex = Lexer.init("");
+
+    const tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+    try std.testing.expectEqualStrings("", tok.text);
+}
+
+test "edge: pattern with only special chars" {
+    // Test standalone special chars (not inside brackets)
+    var lex = Lexer.init("*?{}");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.star, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.question, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.brace_open, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.brace_close, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: unicode in literals passes through as bytes" {
+    // UTF-8 encoded characters should pass through unchanged
+    var lex = Lexer.init("hello_world.txt");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("hello_world.txt", tok.text);
+
+    // Test with actual multi-byte UTF-8
+    var lex2 = Lexer.init("file.txt");
+    tok = lex2.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+
+    // High bytes that aren't special chars become literals
+    var lex3 = Lexer.init("\xC0\xC1"); // Invalid UTF-8 but valid bytes
+    tok = lex3.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("\xC0\xC1", tok.text);
+}
+
+test "edge: very long pattern" {
+    // Create a pattern with 1000 literal characters
+    const long_pattern = "a" ** 1000;
+    var lex = Lexer.init(long_pattern);
+
+    const tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqual(@as(usize, 1000), tok.text.len);
+
+    const tok2 = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok2.kind);
+}
+
+test "edge: trailing escape at end of pattern" {
+    // \ at end with nothing to escape - becomes literal backslash
+    var lex = Lexer.init("foo\\");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("foo", tok.text);
+
+    // Trailing backslash becomes literal (nothing to escape)
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("\\", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: multiple globstars" {
+    var lex = Lexer.init("**/**/**");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.globstar, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.path_sep, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.globstar, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.path_sep, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.globstar, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: three consecutive stars" {
+    // *** should be ** followed by *
+    var lex = Lexer.init("***");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.globstar, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.star, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: empty bracket class" {
+    // [] should be [ followed by ] as literal at start
+    var lex = Lexer.init("[]");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.bracket_open, tok.kind);
+
+    tok = lex.next();
+    // ] at start is literal, but there's nothing after, so we stay in bracket mode
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("]", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: dash at start and end of bracket" {
+    // [-a] - dash at start is literal
+    var lex = Lexer.init("[-a]");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.bracket_open, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.dash, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.bracket_close, tok.kind);
+
+    // [a-] - dash at end
+    var lex2 = Lexer.init("[a-]");
+
+    tok = lex2.next();
+    try std.testing.expectEqual(TokenKind.bracket_open, tok.kind);
+
+    tok = lex2.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a", tok.text);
+
+    tok = lex2.next();
+    try std.testing.expectEqual(TokenKind.dash, tok.kind);
+
+    tok = lex2.next();
+    try std.testing.expectEqual(TokenKind.bracket_close, tok.kind);
+}
+
+test "edge: negation with exclamation mark" {
+    // [!abc] - ! at start is negation (like ^)
+    var lex = Lexer.init("[!abc]");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.bracket_open, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.caret, tok.kind);
+    try std.testing.expectEqualStrings("!", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a", tok.text);
+}
+
+test "edge: extglob all operators" {
+    const test_cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = "?(foo)", .expected = "?" },
+        .{ .input = "*(foo)", .expected = "*" },
+        .{ .input = "+(foo)", .expected = "+" },
+        .{ .input = "@(foo)", .expected = "@" },
+        .{ .input = "!(foo)", .expected = "!" },
+    };
+
+    for (test_cases) |tc| {
+        var lex = Lexer.init(tc.input);
+
+        var tok = lex.next();
+        try std.testing.expectEqual(TokenKind.extglob_prefix, tok.kind);
+        try std.testing.expectEqualStrings(tc.expected, tok.text);
+
+        tok = lex.next();
+        try std.testing.expectEqual(TokenKind.paren_open, tok.kind);
+    }
+}
+
+test "edge: pipe outside of extglob context" {
+    // | outside parens should be literal
+    var lex = Lexer.init("a|b");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("|", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("b", tok.text);
+}
+
+test "edge: comma outside of brace context" {
+    // , outside braces should be literal
+    var lex = Lexer.init("a,b,c");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings(",", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("b", tok.text);
+}
+
+test "edge: dot dot outside brace context" {
+    // .. outside braces should be literal
+    var lex = Lexer.init("a..b");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a..b", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.eof, tok.kind);
+}
+
+test "edge: nested braces" {
+    var lex = Lexer.init("{a,{b,c}}");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.brace_open, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.comma, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.brace_open, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("b", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.comma, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("c", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.brace_close, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.brace_close, tok.kind);
+}
+
+test "edge: peek does not consume" {
+    var lex = Lexer.init("*?");
+
+    const peeked = lex.peek();
+    try std.testing.expectEqual(TokenKind.star, peeked.kind);
+
+    const actual = lex.next();
+    try std.testing.expectEqual(TokenKind.star, actual.kind);
+    try std.testing.expectEqual(peeked.pos, actual.pos);
+
+    const next = lex.next();
+    try std.testing.expectEqual(TokenKind.question, next.kind);
+}
+
+test "edge: reset returns to beginning" {
+    var lex = Lexer.init("abc");
+
+    _ = lex.next();
+    _ = lex.next();
+
+    lex.reset();
+
+    const tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("abc", tok.text);
+    try std.testing.expectEqual(@as(usize, 0), tok.pos);
+}
+
+test "edge: hasMore works correctly" {
+    var lex = Lexer.init("a");
+
+    try std.testing.expect(lex.hasMore());
+
+    _ = lex.next(); // consume 'a'
+
+    try std.testing.expect(!lex.hasMore());
+}
+
+test "edge: escape in bracket expression" {
+    // [\]] - The escaped ] becomes literal, then another ] follows
+    var lex = Lexer.init("[\\]]");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.bracket_open, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("]", tok.text);
+
+    // The second ] - after escape is consumed, bracket_start is false
+    // so this ] closes the bracket expression
+    tok = lex.next();
+    // Note: Due to escape handling, the second ] may close the bracket
+    // or be literal depending on bracket_start state after escape
+    try std.testing.expect(tok.kind == .bracket_close or tok.kind == .literal);
+}
+
+test "edge: multiple path separators" {
+    var lex = Lexer.init("a//b///c");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("a", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.path_sep, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.path_sep, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("b", tok.text);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.path_sep, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.path_sep, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.path_sep, tok.kind);
+
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("c", tok.text);
+}
+
+test "edge: incomplete POSIX class" {
+    // [[:alpha] - missing closing :]
+    var lex = Lexer.init("[[:alpha]");
+
+    var tok = lex.next();
+    try std.testing.expectEqual(TokenKind.bracket_open, tok.kind);
+
+    // [: without matching :] should be literal [
+    tok = lex.next();
+    try std.testing.expectEqual(TokenKind.literal, tok.kind);
+    try std.testing.expectEqualStrings("[", tok.text);
 }

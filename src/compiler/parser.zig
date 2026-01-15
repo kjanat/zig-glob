@@ -171,10 +171,19 @@ pub const Parser = struct {
                 if (self.options.extglob) {
                     return self.parseExtGlob();
                 }
-                // If extglob disabled, treat prefix as literal
-                const text = self.allocator.dupe(u8, self.current.text) catch return ParseError.OutOfMemory;
+                // If extglob disabled, convert prefix to appropriate token type
+                const prefix = self.current.text[0];
                 self.advance();
-                return Node{ .literal = text };
+                return switch (prefix) {
+                    '?' => Node.any_char,
+                    '*' => Node.star,
+                    else => blk: {
+                        // +, @, ! have no meaning outside extglob - treat as literal
+                        const text = self.allocator.alloc(u8, 1) catch return ParseError.OutOfMemory;
+                        text[0] = prefix;
+                        break :blk Node{ .literal = text };
+                    },
+                };
             },
 
             .brace_open => {
@@ -398,7 +407,7 @@ pub const Parser = struct {
         }
         if (alt_list.items.len == 1) {
             const single = alt_list.items[0];
-            alt_list.clearAndFree(self.allocator);
+            alt_list.deinit(self.allocator); // Free backing array, Node value already copied
             return single;
         }
         return Node{ .sequence = alt_list.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory };
@@ -580,4 +589,311 @@ test "parse complex pattern" {
     try std.testing.expect(seg3[0] == .star);
     try std.testing.expectEqualStrings(".", seg3[1].literal);
     try std.testing.expect(seg3[2] == .char_class);
+}
+
+// ============================================================================
+// Edge Case Tests
+// ============================================================================
+
+test "edge: multiple consecutive globstars" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "**/**", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), pattern.segments.len);
+    try std.testing.expect(pattern.segments[0] == .globstar);
+    try std.testing.expect(pattern.segments[1] == .globstar);
+}
+
+test "edge: globstar with literals foo**bar" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "foo**bar", .{});
+    defer pattern.deinit();
+
+    // foo**bar in a single segment - ** becomes globstar
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    const seq = pattern.segments[0].sequence;
+    try std.testing.expectEqualStrings("foo", seq[0].literal);
+    try std.testing.expect(seq[1] == .globstar);
+    try std.testing.expectEqualStrings("bar", seq[2].literal);
+}
+
+test "edge: character class with ] at start" {
+    const allocator = std.testing.allocator;
+    // []abc] - ] at start is literal
+    var pattern = try parse(allocator, "[]abc]", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    const cc = pattern.segments[0].char_class;
+    try std.testing.expect(!cc.negated);
+    // Should have 4 members: ], a, b, c
+    try std.testing.expectEqual(@as(usize, 4), cc.members.len);
+    try std.testing.expectEqual(@as(u8, ']'), cc.members[0].single);
+}
+
+test "edge: character class with - at start" {
+    const allocator = std.testing.allocator;
+    // [-abc] - dash at start is literal
+    var pattern = try parse(allocator, "[-abc]", .{});
+    defer pattern.deinit();
+
+    const cc = pattern.segments[0].char_class;
+    try std.testing.expectEqual(@as(usize, 4), cc.members.len);
+    try std.testing.expectEqual(@as(u8, '-'), cc.members[0].single);
+}
+
+test "edge: character class with negation and -" {
+    const allocator = std.testing.allocator;
+    // [!-] - negated, dash is literal
+    var pattern = try parse(allocator, "[!-]", .{});
+    defer pattern.deinit();
+
+    const cc = pattern.segments[0].char_class;
+    try std.testing.expect(cc.negated);
+    try std.testing.expectEqual(@as(usize, 1), cc.members.len);
+    try std.testing.expectEqual(@as(u8, '-'), cc.members[0].single);
+}
+
+test "edge: empty segments foo//bar" {
+    const allocator = std.testing.allocator;
+    // Multiple slashes create empty segments that get skipped
+    var pattern = try parse(allocator, "foo//bar", .{});
+    defer pattern.deinit();
+
+    // Parser skips consecutive slashes
+    try std.testing.expectEqual(@as(usize, 2), pattern.segments.len);
+    try std.testing.expectEqualStrings("foo", pattern.segments[0].literal);
+    try std.testing.expectEqualStrings("bar", pattern.segments[1].literal);
+}
+
+test "edge: many consecutive slashes" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "a///b////c", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), pattern.segments.len);
+    try std.testing.expectEqualStrings("a", pattern.segments[0].literal);
+    try std.testing.expectEqualStrings("b", pattern.segments[1].literal);
+    try std.testing.expectEqualStrings("c", pattern.segments[2].literal);
+}
+
+test "edge: extglob nested in pattern" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "*.?(txt|md)", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    const seq = pattern.segments[0].sequence;
+    try std.testing.expect(seq[0] == .star);
+    try std.testing.expectEqualStrings(".", seq[1].literal);
+    try std.testing.expect(seq[2] == .extglob);
+    const eg = seq[2].extglob;
+    try std.testing.expectEqual(ExtGlobOp.optional, eg.op);
+}
+
+test "edge: all extglob operators" {
+    const allocator = std.testing.allocator;
+
+    // Test each extglob operator individually
+    var p1 = try parse(allocator, "?(a)", .{});
+    defer p1.deinit();
+    try std.testing.expect(p1.segments[0] == .extglob);
+    try std.testing.expectEqual(ExtGlobOp.optional, p1.segments[0].extglob.op);
+
+    var p2 = try parse(allocator, "+(a)", .{});
+    defer p2.deinit();
+    try std.testing.expect(p2.segments[0] == .extglob);
+    try std.testing.expectEqual(ExtGlobOp.one_or_more, p2.segments[0].extglob.op);
+
+    var p3 = try parse(allocator, "@(a)", .{});
+    defer p3.deinit();
+    try std.testing.expect(p3.segments[0] == .extglob);
+    try std.testing.expectEqual(ExtGlobOp.exactly_one, p3.segments[0].extglob.op);
+
+    var p4 = try parse(allocator, "!(a)", .{});
+    defer p4.deinit();
+    try std.testing.expect(p4.segments[0] == .extglob);
+    try std.testing.expectEqual(ExtGlobOp.negated, p4.segments[0].extglob.op);
+
+    // *(a) is special - * followed by (a) could be ambiguous
+    // The lexer should recognize *( as extglob prefix
+    var p5 = try parse(allocator, "*(a)", .{});
+    defer p5.deinit();
+    try std.testing.expect(p5.segments[0] == .extglob);
+    try std.testing.expectEqual(ExtGlobOp.zero_or_more, p5.segments[0].extglob.op);
+}
+
+test "edge: extglob with multiple alternatives" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "*(a|b|c|d)", .{});
+    defer pattern.deinit();
+
+    const eg = pattern.segments[0].extglob;
+    try std.testing.expectEqual(ExtGlobOp.zero_or_more, eg.op);
+    try std.testing.expectEqual(@as(usize, 4), eg.alternatives.len);
+}
+
+test "edge: empty pattern parses to empty segments" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), pattern.segments.len);
+}
+
+test "edge: just a slash" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "/", .{});
+    defer pattern.deinit();
+
+    try std.testing.expect(pattern.is_absolute);
+    // Note: trailing_slash depends on implementation detail
+    try std.testing.expectEqual(@as(usize, 0), pattern.segments.len);
+}
+
+test "edge: just multiple slashes" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "///", .{});
+    defer pattern.deinit();
+
+    try std.testing.expect(pattern.is_absolute);
+    try std.testing.expectEqual(@as(usize, 0), pattern.segments.len);
+}
+
+test "edge: unclosed character class" {
+    const allocator = std.testing.allocator;
+    const result = parse(allocator, "[abc", .{});
+    try std.testing.expectError(ParseError.UnclosedCharClass, result);
+}
+
+test "edge: unclosed extglob" {
+    const allocator = std.testing.allocator;
+    const result = parse(allocator, "?(abc", .{});
+    try std.testing.expectError(ParseError.UnclosedExtGlob, result);
+}
+
+test "edge: globstar disabled treats ** as *" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "**", .{ .globstar = false });
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    // When globstar is disabled, ** becomes a single star
+    try std.testing.expect(pattern.segments[0] == .star);
+}
+
+test "edge: extglob disabled treats prefix as literal" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "?(a|b)", .{ .extglob = false });
+    defer pattern.deinit();
+
+    // With extglob disabled, ? is a wildcard (not extglob prefix)
+    // The exact structure depends on how the lexer handles it
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    // Just verify it's not an extglob
+    try std.testing.expect(pattern.segments[0] != .extglob);
+}
+
+test "edge: character class with POSIX and singles mixed" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "[[:alpha:]abc]", .{});
+    defer pattern.deinit();
+
+    const cc = pattern.segments[0].char_class;
+    // Should have 4 members: [:alpha:], a, b, c
+    try std.testing.expectEqual(@as(usize, 4), cc.members.len);
+    try std.testing.expectEqual(PosixClass.alpha, cc.members[0].posix);
+    try std.testing.expectEqual(@as(u8, 'a'), cc.members[1].single);
+}
+
+test "edge: character class with multiple ranges" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "[a-zA-Z0-9]", .{});
+    defer pattern.deinit();
+
+    const cc = pattern.segments[0].char_class;
+    try std.testing.expectEqual(@as(usize, 3), cc.members.len);
+    // a-z range
+    try std.testing.expectEqual(@as(u8, 'a'), cc.members[0].range.start);
+    try std.testing.expectEqual(@as(u8, 'z'), cc.members[0].range.end);
+    // A-Z range
+    try std.testing.expectEqual(@as(u8, 'A'), cc.members[1].range.start);
+    try std.testing.expectEqual(@as(u8, 'Z'), cc.members[1].range.end);
+    // 0-9 range
+    try std.testing.expectEqual(@as(u8, '0'), cc.members[2].range.start);
+    try std.testing.expectEqual(@as(u8, '9'), cc.members[2].range.end);
+}
+
+test "edge: pattern with brace (treated as literal)" {
+    const allocator = std.testing.allocator;
+    // Braces should be expanded before parsing, but if they reach parser,
+    // they're treated as literals
+    var pattern = try parse(allocator, "{a,b}", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    // The whole thing becomes a sequence of literals
+    const seq = pattern.segments[0].sequence;
+    try std.testing.expectEqualStrings("{", seq[0].literal);
+}
+
+test "edge: very long literal" {
+    const allocator = std.testing.allocator;
+    const long_name = "a" ** 500;
+    var pattern = try parse(allocator, long_name, .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    try std.testing.expectEqual(@as(usize, 500), pattern.segments[0].literal.len);
+}
+
+test "edge: pattern ending with question mark" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "file?", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    const seq = pattern.segments[0].sequence;
+    try std.testing.expectEqualStrings("file", seq[0].literal);
+    try std.testing.expect(seq[1] == .any_char);
+}
+
+test "edge: pattern with escaped star" {
+    const allocator = std.testing.allocator;
+    var pattern = try parse(allocator, "\\*file", .{});
+    defer pattern.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pattern.segments.len);
+    const seq = pattern.segments[0].sequence;
+    try std.testing.expectEqualStrings("*", seq[0].literal);
+    try std.testing.expectEqualStrings("file", seq[1].literal);
+}
+
+test "edge: hasGlobstar detection" {
+    const allocator = std.testing.allocator;
+
+    var p1 = try parse(allocator, "**/*.txt", .{});
+    defer p1.deinit();
+    try std.testing.expect(p1.hasGlobstar());
+
+    var p2 = try parse(allocator, "*.txt", .{});
+    defer p2.deinit();
+    try std.testing.expect(!p2.hasGlobstar());
+}
+
+test "edge: literalPrefix extraction" {
+    const allocator = std.testing.allocator;
+
+    var p1 = try parse(allocator, "src/**/*.txt", .{});
+    defer p1.deinit();
+    try std.testing.expectEqualStrings("src", p1.literalPrefix().?);
+
+    var p2 = try parse(allocator, "**/*.txt", .{});
+    defer p2.deinit();
+    try std.testing.expect(p2.literalPrefix() == null);
+
+    var p3 = try parse(allocator, "*", .{});
+    defer p3.deinit();
+    try std.testing.expect(p3.literalPrefix() == null);
 }

@@ -82,9 +82,16 @@ pub const Matcher = struct {
 
         // Base case: no more path segments but pattern remains
         if (path_idx >= path_segs.len) {
-            // Check if remaining pattern can match empty
+            // Check if remaining patterns can all be satisfied with no more path segments
+            // This is true if: all remaining patterns are globstar, OR
+            // there's exactly one remaining pattern that can match empty (like `*`)
+            if (pattern_segs.len == 1 and self.canMatchEmpty(pattern_segs[0])) {
+                // Single pattern that can match empty string (e.g., `*` matches "")
+                return true;
+            }
+            // For multiple remaining segments, only globstar can be skipped
             for (pattern_segs) |seg| {
-                if (!self.canMatchEmpty(seg)) {
+                if (!self.canSkipSegment(seg)) {
                     return false;
                 }
             }
@@ -415,6 +422,30 @@ pub const Matcher = struct {
             },
         };
     }
+
+    /// Check if a pattern segment can be skipped entirely (match zero path segments).
+    /// Only globstar can match zero path segments; other patterns need a segment.
+    fn canSkipSegment(self: *Matcher, node: Node) bool {
+        _ = self;
+        return switch (node) {
+            .globstar => true,
+            .segment => |seg| {
+                // Segment is skippable if it contains only globstar
+                if (seg.len == 1) {
+                    return seg[0] == .globstar;
+                }
+                return false;
+            },
+            .sequence => |seq| {
+                // Sequence is skippable if it contains only globstar
+                if (seq.len == 1) {
+                    return seq[0] == .globstar;
+                }
+                return false;
+            },
+            else => false,
+        };
+    }
 };
 
 fn canMatchEmptyNode(node: Node) bool {
@@ -611,4 +642,301 @@ test "globstar segment matching" {
     var path_segs2 = [_][]const u8{ "foo", "file.txt" };
     const result2 = matcher.matchSegments(pattern.segments, &path_segs2, 0);
     try testing.expect(result2);
+}
+
+// ============================================================================
+// Edge Case Tests
+// ============================================================================
+
+test "edge: pattern matching empty string" {
+    // Star should match empty string
+    try testMatch("*", "", true);
+
+    // Question mark should not match empty
+    try testMatch("?", "", false);
+
+    // Literal should not match empty
+    try testMatch("a", "", false);
+}
+
+test "edge: empty pattern matches empty path" {
+    const allocator = testing.allocator;
+    var pattern = try parser.parse(allocator, "", .{});
+    defer pattern.deinit();
+
+    var matcher = Matcher.init(allocator, &pattern, .{});
+    defer matcher.deinit();
+
+    const result = try matcher.matchPath("");
+    try testing.expect(result);
+}
+
+test "edge: very deep path with globstar" {
+    // 10 levels deep
+    try testMatch("**/*.txt", "a/b/c/d/e/f/g/h/i/j/file.txt", true);
+
+    // 20 levels deep
+    try testMatch("**/*.txt", "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/file.txt", true);
+}
+
+test "edge: globstar at various positions" {
+    // Globstar at start
+    try testMatch("**/file.txt", "file.txt", true);
+    try testMatch("**/file.txt", "a/file.txt", true);
+    try testMatch("**/file.txt", "a/b/file.txt", true);
+
+    // Globstar in middle
+    try testMatch("src/**/test.txt", "src/test.txt", true);
+    try testMatch("src/**/test.txt", "src/a/test.txt", true);
+    try testMatch("src/**/test.txt", "src/a/b/test.txt", true);
+
+    // Globstar at end
+    try testMatch("src/**", "src", true);
+    try testMatch("src/**", "src/a", true);
+    try testMatch("src/**", "src/a/b", true);
+}
+
+test "edge: multiple consecutive globstars" {
+    try testMatch("**/**/*.txt", "file.txt", true);
+    try testMatch("**/**/*.txt", "a/file.txt", true);
+    try testMatch("**/**/*.txt", "a/b/c/file.txt", true);
+}
+
+test "edge: case sensitivity" {
+    // Default: case sensitive
+    try testMatch("*.TXT", "file.txt", false);
+    try testMatch("*.TXT", "file.TXT", true);
+
+    // Case insensitive
+    const allocator = testing.allocator;
+    var pattern = try parser.parse(allocator, "*.TXT", .{});
+    defer pattern.deinit();
+
+    var matcher = Matcher.init(allocator, &pattern, .{ .nocase = true });
+    defer matcher.deinit();
+
+    const result = try matcher.matchPath("file.txt");
+    try testing.expect(result);
+}
+
+test "edge: paths with special chars that look like glob" {
+    // Literal [ and ] in path should not be interpreted as glob
+    const allocator = testing.allocator;
+
+    // Pattern with literal [ via escape
+    var pattern = try parser.parse(allocator, "file\\[1\\].txt", .{});
+    defer pattern.deinit();
+
+    var matcher = Matcher.init(allocator, &pattern, .{});
+    defer matcher.deinit();
+
+    // Path segment is the full filename
+    try testing.expect(matcher.matchNode(pattern.segments[0], "file[1].txt"));
+}
+
+test "edge: star does not match slash" {
+    try testMatch("*", "a/b", false);
+    try testMatch("*/*", "a/b", true);
+    // "*/*" pattern requires two path segments, "a" has only one
+    // But testMatch uses matchPath which splits on /
+    // For single segment "a", pattern "*/*" should not match
+    // Note: actual behavior depends on globstar handling
+}
+
+test "edge: question mark does not match slash" {
+    try testMatch("?", "/", false);
+    try testMatch("a?b", "a/b", false);
+}
+
+test "edge: character class matching" {
+    // Basic character class
+    try testMatch("[abc]", "a", true);
+    try testMatch("[abc]", "b", true);
+    try testMatch("[abc]", "c", true);
+    try testMatch("[abc]", "d", false);
+
+    // Negated character class
+    try testMatch("[^abc]", "a", false);
+    try testMatch("[^abc]", "d", true);
+    try testMatch("[!abc]", "a", false);
+    try testMatch("[!abc]", "d", true);
+
+    // Range
+    try testMatch("[a-z]", "m", true);
+    try testMatch("[a-z]", "M", false);
+    try testMatch("[A-Z]", "M", true);
+    try testMatch("[0-9]", "5", true);
+}
+
+test "edge: extglob optional matching" {
+    // ?(pattern) - zero or one
+    try testMatch("file?(s).txt", "file.txt", true);
+    try testMatch("file?(s).txt", "files.txt", true);
+    try testMatch("file?(s).txt", "filess.txt", false);
+}
+
+test "edge: extglob zero or more matching" {
+    // *(pattern) - zero or more
+    try testMatch("file*(s).txt", "file.txt", true);
+    try testMatch("file*(s).txt", "files.txt", true);
+    try testMatch("file*(s).txt", "filess.txt", true);
+    try testMatch("file*(s).txt", "filesss.txt", true);
+}
+
+test "edge: extglob one or more matching" {
+    // +(pattern) - one or more
+    try testMatch("file+(s).txt", "file.txt", false);
+    try testMatch("file+(s).txt", "files.txt", true);
+    try testMatch("file+(s).txt", "filess.txt", true);
+}
+
+test "edge: extglob exactly one matching" {
+    // @(pattern) - exactly one
+    try testMatch("file@(s).txt", "file.txt", false);
+    try testMatch("file@(s).txt", "files.txt", true);
+    try testMatch("file@(s).txt", "filess.txt", false);
+}
+
+test "edge: extglob negation matching" {
+    // !(pattern) - anything except
+    try testMatch("!(*.txt)", "file.md", true);
+    try testMatch("!(*.txt)", "file.txt", false);
+}
+
+test "edge: extglob with alternatives" {
+    try testMatch("*.?(txt|md)", "file.txt", true);
+    try testMatch("*.?(txt|md)", "file.md", true);
+    try testMatch("*.?(txt|md)", "file.", true);
+    try testMatch("*.?(txt|md)", "file.rs", false);
+}
+
+test "edge: dotfile handling default" {
+    // Default: wildcards don't match dotfiles at start of segment
+    const allocator = testing.allocator;
+
+    var pattern = try parser.parse(allocator, "*", .{});
+    defer pattern.deinit();
+
+    var matcher = Matcher.init(allocator, &pattern, .{ .dot = false });
+    defer matcher.deinit();
+
+    try testing.expect(!matcher.matchNode(pattern.segments[0], ".hidden"));
+    try testing.expect(matcher.matchNode(pattern.segments[0], "visible"));
+
+    // But explicit dot in pattern should match
+    var pattern2 = try parser.parse(allocator, ".*", .{});
+    defer pattern2.deinit();
+
+    var matcher2 = Matcher.init(allocator, &pattern2, .{ .dot = false });
+    defer matcher2.deinit();
+
+    try testing.expect(matcher2.matchNode(pattern2.segments[0], ".hidden"));
+}
+
+test "edge: dotfile handling with dot=true" {
+    const allocator = testing.allocator;
+
+    var pattern = try parser.parse(allocator, "*", .{});
+    defer pattern.deinit();
+
+    var matcher = Matcher.init(allocator, &pattern, .{ .dot = true });
+    defer matcher.deinit();
+
+    try testing.expect(matcher.matchNode(pattern.segments[0], ".hidden"));
+    try testing.expect(matcher.matchNode(pattern.segments[0], "visible"));
+}
+
+test "edge: complex pattern combinations" {
+    // Mix of star, question, and character class
+    try testMatch("*.[ch]", "foo.c", true);
+    try testMatch("*.[ch]", "foo.h", true);
+    try testMatch("*.[ch]", "foo.o", false);
+
+    try testMatch("test?.txt", "test1.txt", true);
+    try testMatch("test?.txt", "test12.txt", false);
+    try testMatch("test?.txt", "test.txt", false);
+
+    try testMatch("**/src/*.[ch]", "project/src/main.c", true);
+    try testMatch("**/src/*.[ch]", "a/b/c/src/main.h", true);
+}
+
+test "edge: absolute path patterns" {
+    try testMatch("/usr/bin/*", "/usr/bin/ls", true);
+    // Note: The relative path "usr/bin/ls" against absolute pattern "/usr/bin/*"
+    // behavior depends on is_absolute flag handling in matchPath
+}
+
+test "edge: trailing slash patterns" {
+    const allocator = testing.allocator;
+    var pattern = try parser.parse(allocator, "src/", .{});
+    defer pattern.deinit();
+
+    try testing.expect(pattern.trailing_slash);
+}
+
+test "edge: overlapping patterns behavior" {
+    // Pattern should match the expected path exactly
+    try testMatch("*.txt", "file.txt", true);
+    try testMatch("file.*", "file.txt", true);
+    try testMatch("*.*", "file.txt", true);
+    try testMatch("f*.txt", "file.txt", true);
+    try testMatch("*.t*", "file.txt", true);
+}
+
+test "edge: empty segments in path" {
+    // Paths with empty components (like "a//b") should handle gracefully
+    const allocator = testing.allocator;
+    var pattern = try parser.parse(allocator, "a/b", .{});
+    defer pattern.deinit();
+
+    var matcher = Matcher.init(allocator, &pattern, .{});
+    defer matcher.deinit();
+
+    // Path "a//b" has empty segment - matchPath splits on /
+    const result = try matcher.matchPath("a//b");
+    // Empty segments are filtered out, so this should still match
+    try testing.expect(result);
+}
+
+test "edge: star matches multiple characters" {
+    try testMatch("*.txt", "verylongfilename.txt", true);
+    try testMatch("*.txt", "a.txt", true);
+    // ".txt" has a dot at start - with dot=false (default), star won't match dotfiles
+    // So "*.txt" against ".txt" depends on dotfile handling
+
+    try testMatch("*a*.txt", "aaa.txt", true);
+    try testMatch("*a*.txt", "bab.txt", true);
+    try testMatch("*a*.txt", "bbb.txt", false);
+}
+
+test "edge: canMatchEmpty for various nodes" {
+    const allocator = testing.allocator;
+
+    // Star can match empty
+    var p1 = try parser.parse(allocator, "*", .{});
+    defer p1.deinit();
+    var m1 = Matcher.init(allocator, &p1, .{});
+    defer m1.deinit();
+    try testing.expect(m1.canMatchEmpty(p1.segments[0]));
+
+    // Question cannot match empty
+    var p2 = try parser.parse(allocator, "?", .{});
+    defer p2.deinit();
+    var m2 = Matcher.init(allocator, &p2, .{});
+    defer m2.deinit();
+    try testing.expect(!m2.canMatchEmpty(p2.segments[0]));
+
+    // Literal cannot match empty (unless it IS empty)
+    var p3 = try parser.parse(allocator, "a", .{});
+    defer p3.deinit();
+    var m3 = Matcher.init(allocator, &p3, .{});
+    defer m3.deinit();
+    try testing.expect(!m3.canMatchEmpty(p3.segments[0]));
+
+    // Globstar can match empty (zero path components)
+    var p4 = try parser.parse(allocator, "**", .{});
+    defer p4.deinit();
+    var m4 = Matcher.init(allocator, &p4, .{});
+    defer m4.deinit();
+    try testing.expect(m4.canMatchEmpty(p4.segments[0]));
 }
