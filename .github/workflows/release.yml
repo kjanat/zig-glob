@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   build:
+    name: Build version ${{ github.ref_name }}
     runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
     steps:
       - uses: actions/checkout@v6
 
@@ -35,6 +37,7 @@ jobs:
           subject-path: zig-out/bin/zig-glob-*
 
   release:
+    name: Create Release for ${{ github.ref_name }}
     needs: build
     runs-on: ubuntu-latest
     steps:
