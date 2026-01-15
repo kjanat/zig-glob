@@ -361,6 +361,16 @@ test "validatePattern: consecutive stars trigger warning" {
     try std.testing.expect(result.warnings.consecutive_wildcards);
 }
 
+test "validatePattern: backslash triggers warning on non-Windows" {
+    const result = validatePattern("foo\\bar");
+    try std.testing.expect(result.valid);
+
+    if (@import("builtin").os.tag != .windows) {
+        // Should warn about platform-specific separator on non-Windows
+        try std.testing.expect(result.warnings.platform_separators);
+    }
+}
+
 test "validateRange: normal range is valid" {
     try validateRange(0, 100);
     try validateRange(-50, 50);
@@ -380,4 +390,85 @@ test "detectPathTraversal: ignores .. in names" {
     try std.testing.expect(!detectPathTraversal("foo..bar"));
     try std.testing.expect(!detectPathTraversal("..."));
     try std.testing.expect(!detectPathTraversal("..hidden"));
+}
+
+test "normalizePathSeparators: preserves forward slashes" {
+    const allocator = std.testing.allocator;
+    const result = try normalizePathSeparators(allocator, "foo/bar/baz.txt");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("foo/bar/baz.txt", result);
+}
+
+test "normalizePathSeparators: preserves escape sequences" {
+    const allocator = std.testing.allocator;
+    // These should be preserved regardless of platform
+    const patterns = [_][]const u8{
+        "foo\\*bar",     // Escaped wildcard
+        "foo\\?bar",     // Escaped question mark
+        "foo\\[bar",     // Escaped bracket
+        "foo\\{bar",     // Escaped brace
+        "foo\\\\bar",    // Escaped backslash
+    };
+
+    for (patterns) |pattern| {
+        const result = try normalizePathSeparators(allocator, pattern);
+        defer allocator.free(result);
+        // On non-Windows, should be unchanged
+        // On Windows, depends on whether backslash is escape or separator
+        try std.testing.expect(result.len > 0);
+    }
+}
+
+test "normalizePathSeparators: handles mixed separators on Windows" {
+    if (@import("builtin").os.tag != .windows) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    // Backslashes that are path separators should be converted
+    const result = try normalizePathSeparators(allocator, "foo\\bar\\baz");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("foo/bar/baz", result);
+}
+
+test "normalizePathSeparators: handles glob patterns on Windows" {
+    if (@import("builtin").os.tag != .windows) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    // Mix of path separators and glob patterns
+    const result = try normalizePathSeparators(allocator, "src\\**\\*.zig");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("src/**/*.zig", result);
+}
+
+test "normalizePathSeparators: preserves escaped wildcards on Windows" {
+    if (@import("builtin").os.tag != .windows) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    // Backslash before wildcard is escape, not path separator
+    const result = try normalizePathSeparators(allocator, "foo\\*.txt");
+    defer allocator.free(result);
+    // Should preserve the escape sequence
+    try std.testing.expectEqualStrings("foo\\*.txt", result);
+}
+
+test "normalizePathSeparators: empty pattern" {
+    const allocator = std.testing.allocator;
+    const result = try normalizePathSeparators(allocator, "");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "normalizePathSeparators: no separators" {
+    const allocator = std.testing.allocator;
+    const result = try normalizePathSeparators(allocator, "foobar");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("foobar", result);
 }

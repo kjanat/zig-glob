@@ -3,6 +3,13 @@
 //! This module provides policies for handling symbolic links during glob
 //! pattern matching, including cycle detection to prevent infinite loops
 //! when following directory symlinks.
+//!
+//! Platform-specific behavior:
+//! - Linux/macOS: Full symlink support with device ID from dev_major/dev_minor
+//! - Windows: Symlink support with device ID from volume serial number
+//!   - Cycle detection works across different drives (C:, D:, etc.)
+//!   - Creating symlinks requires Administrator privileges or Developer Mode
+//!   - Tests are skipped on Windows due to privilege requirements
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -170,6 +177,44 @@ const StatInfo = struct {
     kind: std.fs.File.Kind,
 };
 
+/// Get Windows volume serial number from a file path (Windows only).
+/// This provides proper device identification for cycle detection across drives.
+fn getWindowsVolumeSerial(dir: std.fs.Dir, name: []const u8) ?u64 {
+    if (comptime builtin.os.tag != .windows) return null;
+
+    const windows = std.os.windows;
+
+    // Open the file to get its handle
+    const file = dir.openFile(name, .{}) catch return null;
+    defer file.close();
+
+    return getWindowsVolumeSerialFromHandle(file.handle);
+}
+
+/// Get Windows volume serial number from a directory handle (Windows only).
+fn getWindowsVolumeSerialFromDir(dir: std.fs.Dir) ?u64 {
+    if (comptime builtin.os.tag != .windows) return null;
+
+    const windows = std.os.windows;
+    return getWindowsVolumeSerialFromHandle(dir.fd);
+}
+
+/// Get Windows volume serial number from a file handle (Windows only).
+fn getWindowsVolumeSerialFromHandle(handle: std.os.windows.HANDLE) ?u64 {
+    if (comptime builtin.os.tag != .windows) return null;
+
+    const windows = std.os.windows;
+
+    // Get file information which includes volume serial number
+    var info: windows.BY_HANDLE_FILE_INFORMATION = undefined;
+    if (windows.kernel32.GetFileInformationByHandle(handle, &info) == 0) {
+        return null;
+    }
+
+    // The dwVolumeSerialNumber field uniquely identifies the volume
+    return @as(u64, info.dwVolumeSerialNumber);
+}
+
 /// Stat a path without following symlinks (lstat behavior).
 fn lstatPath(dir: std.fs.Dir, name: []const u8) ?StatInfo {
     if (comptime builtin.os.tag == .linux) {
@@ -193,7 +238,10 @@ fn lstatPath(dir: std.fs.Dir, name: []const u8) ?StatInfo {
         return .{ .dev = dev, .inode = stx.ino, .kind = kind };
     } else if (comptime builtin.os.tag == .windows) {
         const stat = dir.statFile(name) catch return null;
-        return .{ .dev = 0, .inode = stat.inode, .kind = stat.kind };
+        // For lstat behavior, use the directory's volume serial since
+        // the symlink itself is on the same volume as its parent
+        const dev = getWindowsVolumeSerialFromDir(dir) orelse 0;
+        return .{ .dev = dev, .inode = stat.inode, .kind = stat.kind };
     } else {
         const st = posix.fstatat(dir.fd, name, posix.AT.SYMLINK_NOFOLLOW) catch return null;
         const kind = kindFromPosixMode(st.mode);
@@ -240,7 +288,7 @@ fn kindFromPosixMode(mode: posix.mode_t) std.fs.File.Kind {
 /// Get inode key from a directory's stat info.
 /// On Linux, uses statx to get dev_major/dev_minor.
 /// On other POSIX systems, uses standard stat.
-/// On Windows, uses file index with dev=0.
+/// On Windows, uses file index with volume serial as device ID.
 fn getInodeKeyFromDir(dir: std.fs.Dir) ?InodeKey {
     if (comptime builtin.os.tag == .linux) {
         // Use fstat on the directory handle
@@ -259,7 +307,9 @@ fn getInodeKeyFromDir(dir: std.fs.Dir) ?InodeKey {
         return .{ .dev = dev, .inode = stx.ino };
     } else if (comptime builtin.os.tag == .windows) {
         const stat = dir.stat() catch return null;
-        return .{ .dev = 0, .inode = stat.inode };
+        // Try to get volume serial number for proper device tracking
+        const dev = getWindowsVolumeSerialFromDir(dir) orelse 0;
+        return .{ .dev = dev, .inode = stat.inode };
     } else {
         const st = posix.fstat(dir.fd) catch return null;
         return .{ .dev = st.dev, .inode = st.ino };
@@ -311,10 +361,13 @@ fn getInodeKeyPosix(dir: std.fs.Dir, name: []const u8, follow_symlinks: bool) ?I
     return .{ .dev = st.dev, .inode = st.ino };
 }
 
-/// Windows implementation using file index.
+/// Windows implementation using file index and volume serial.
 fn getInodeKeyWindows(dir: std.fs.Dir, name: []const u8) ?InodeKey {
     const stat = dir.statFile(name) catch return null;
-    return .{ .dev = 0, .inode = stat.inode };
+    // Get volume serial number from the file if possible, otherwise from the directory
+    const dev = getWindowsVolumeSerial(dir, name) orelse
+        getWindowsVolumeSerialFromDir(dir) orelse 0;
+    return .{ .dev = dev, .inode = stat.inode };
 }
 
 /// Check whether the walker should descend into a directory entry.
@@ -544,7 +597,9 @@ test "SymlinkPolicy presets" {
 }
 
 test "shouldDescend with real filesystem" {
-    // Skip on Windows for now due to different symlink semantics
+    // Skip on Windows: Creating symlinks requires elevated privileges (Administrator)
+    // or Developer Mode enabled. The functionality works on Windows when symlinks
+    // exist, but we cannot reliably test it without special permissions.
     if (comptime builtin.os.tag == .windows) {
         return error.SkipZigTest;
     }
@@ -651,7 +706,7 @@ test "shouldDescend with real filesystem" {
 }
 
 test "cycle detection" {
-    // Skip on Windows
+    // Skip on Windows: Requires symlink creation privileges
     if (comptime builtin.os.tag == .windows) {
         return error.SkipZigTest;
     }
@@ -684,7 +739,7 @@ test "cycle detection" {
 }
 
 test "cycle detection with symlink loop" {
-    // Skip on Windows
+    // Skip on Windows: Requires symlink creation privileges
     if (comptime builtin.os.tag == .windows) {
         return error.SkipZigTest;
     }
@@ -727,7 +782,7 @@ test "cycle detection with symlink loop" {
 }
 
 test "isBrokenSymlink" {
-    // Skip on Windows
+    // Skip on Windows: Requires symlink creation privileges
     if (comptime builtin.os.tag == .windows) {
         return error.SkipZigTest;
     }
@@ -756,7 +811,7 @@ test "isBrokenSymlink" {
 }
 
 test "getEffectiveKind" {
-    // Skip on Windows
+    // Skip on Windows: Requires symlink creation privileges
     if (comptime builtin.os.tag == .windows) {
         return error.SkipZigTest;
     }

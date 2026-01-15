@@ -118,6 +118,13 @@ Some character class patterns have edge case handling issues:
 - On Windows, backslashes in patterns should be escaped or normalized
 - Use `validation.normalizePathSeparators()` for cross-platform patterns
 
+**Cross-Platform Recommendations**:
+- Always use forward slashes (`/`) in patterns for maximum portability
+- On Windows, call `normalizePathSeparators()` if accepting user input that may contain backslashes
+- Escape special glob characters in literal path segments:
+  - Escape `*`, `?`, `[`, `]`, `{`, `}` with backslash if they should be treated literally
+  - Example: `foo\\*.txt` to match the literal filename `foo*.txt`
+
 ### 4. Memory Allocation
 
 All operations that allocate memory can return `OutOfMemory`:
@@ -136,6 +143,35 @@ Very large directories (millions of files) may:
 - Take time to iterate
 
 Consider using `max_depth` limits for protection.
+
+## Cross-Platform Improvements
+
+### Windows Device Tracking (v0.1.1+)
+
+Previous versions had a limitation where Windows device IDs were always set to 0, which prevented proper cycle detection across different drives. This has been fixed:
+
+**Before**:
+```zig
+// Old implementation - no cross-drive cycle detection
+return .{ .dev = 0, .inode = stat.inode };
+```
+
+**After**:
+```zig
+// New implementation - uses volume serial number
+const dev = getWindowsVolumeSerialFromDir(dir) orelse 0;
+return .{ .dev = dev, .inode = stat.inode };
+```
+
+**Benefits**:
+- Cycle detection now works correctly across different Windows drives (C:, D:, E:, etc.)
+- Prevents infinite loops when following symlinks across volumes
+- Matches behavior of POSIX systems with proper device ID tracking
+
+**Technical Details**:
+- Uses Windows `GetFileInformationByHandle` API to retrieve volume serial number
+- Volume serial number uniquely identifies each filesystem/drive
+- Falls back to 0 if volume information cannot be retrieved (rare, maintains backward compatibility)
 
 ## Security Considerations
 
@@ -165,14 +201,25 @@ Patterns with null bytes are rejected to prevent path manipulation attacks.
 ### Linux/macOS
 
 - Case-sensitive matching by default
-- Symlink cycle detection uses inode numbers
+- Full symlink support with cycle detection using device ID (dev_major/dev_minor) and inode numbers
 - Permission errors silently skip entries (default)
+- All filesystem features fully supported
 
 ### Windows
 
-- Use `nocase: true` for case-insensitive filesystem matching
-- Backslash handling requires escaping or normalization
-- Some POSIX character classes may not work as expected
+- **Case Sensitivity**: Use `nocase: true` for case-insensitive filesystem matching
+- **Path Separators**: Both `/` and `\` are treated as path separators
+  - Backslash handling requires escaping or normalization
+  - Use `validation.normalizePathSeparators()` for cross-platform patterns
+  - Ambiguity between escape sequences (e.g., `\*`) and path separators (e.g., `foo\bar`)
+- **Symlink Support**:
+  - Symlink following and cycle detection are fully implemented
+  - Cycle detection uses volume serial number for device ID (supports cross-drive detection)
+  - **Limitation**: Creating symlinks requires Administrator privileges or Developer Mode
+  - Tests are skipped on Windows due to privilege requirements for symlink creation
+- **Device Tracking**: Uses volume serial number to distinguish different drives (C:, D:, etc.)
+- **POSIX Character Classes**: May not work as expected for non-ASCII characters
+- **Unicode**: Pattern matching is byte-level; case-insensitive matching only works for ASCII
 
 ## Testing Edge Cases
 

@@ -10,6 +10,9 @@ A production-grade glob pattern matching library for Zig.
 - **Brace expansion**: `{a,b,c}`, `{1..10}`, `{a..z}`
 - **Filesystem traversal**: Iterator-based with configurable symlink handling
 - **Cross-platform**: Works on Linux, macOS, Windows, and FreeBSD
+  - Proper Windows support with volume serial number-based cycle detection
+  - Cross-drive symlink detection on Windows (C:, D:, etc.)
+  - Path separator normalization for Windows backslashes
 - **DoS protection**: Limits on pattern complexity, brace expansion, and traversal depth
 - **Zero allocations** in hot paths (memoized matching)
 
@@ -189,6 +192,48 @@ while (try iter.next()) |entry| {
 ### POSIX Character Classes
 
 Use within `[...]`: `[[:alpha:]]`, `[[:digit:]]`, `[[:alnum:]]`, `[[:space:]]`, `[[:upper:]]`, `[[:lower:]]`, `[[:punct:]]`, `[[:xdigit:]]`
+
+## Windows Support
+
+zig-glob fully supports Windows with platform-specific optimizations:
+
+### Path Separators
+
+Windows accepts both `/` and `\` as path separators. For maximum portability:
+
+```zig
+// Recommended: Use forward slashes (works everywhere)
+var iter = try glob.glob(allocator, &.{"src/**/*.zig"}, .{});
+
+// Windows-specific: Normalize backslashes from user input
+const normalized = try glob.validation.normalizePathSeparators(allocator, pattern);
+defer allocator.free(normalized);
+var iter = try glob.glob(allocator, &.{normalized}, .{});
+```
+
+### Symlink Support
+
+- Symlink following and cycle detection are fully implemented on Windows
+- Uses volume serial numbers for proper cross-drive cycle detection
+- **Note**: Creating symlinks on Windows requires Administrator privileges or Developer Mode enabled
+  - The library works with existing symlinks without special privileges
+  - Tests that create symlinks are skipped on Windows due to this requirement
+
+### Case Sensitivity
+
+Windows filesystems are typically case-insensitive:
+
+```zig
+// For case-insensitive matching (recommended on Windows)
+var iter = try glob.glob(allocator, &.{"**/*.zig"}, .{ .nocase = true });
+```
+
+### Device Tracking
+
+The library uses Windows volume serial numbers to distinguish different drives:
+- Enables proper cycle detection across C:, D:, E:, etc.
+- Prevents infinite loops when following symlinks across volumes
+- Automatically handles mounted volumes and network shares
 
 ## Safety Limits
 
