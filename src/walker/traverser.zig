@@ -599,30 +599,38 @@ pub const Walker = struct {
     }
 
     /// Check if an entry matches the pattern after globstar.
+    /// Handles two cases:
+    /// 1. Globstar is last segment: match everything (files and directories)
+    /// 2. More segments after globstar: only handle directory descent for continuing match
+    ///    File matching is handled by skip work items to avoid duplicates.
     fn checkGlobstarMatch(self: *Walker, state: *IterState, entry: std.fs.Dir.Entry) !void {
         const next_idx = state.work_item.segment_idx + 1;
-        if (next_idx >= self.pattern.segments.len) {
-            // Globstar is last segment: everything matches
-            const match_path = try self.buildPath(state.work_item.prefix, entry.name);
-            try self.pending_matches.append(.{
-                .path = match_path,
-                .kind = entry.kind,
-            });
-            return;
-        }
 
-        // Check if entry matches next segment
-        const next_segment = self.pattern.segments[next_idx];
-        if (self.matchesSegment(next_segment, entry.name)) {
-            if (next_idx + 1 >= self.pattern.segments.len) {
-                // Last segment matched
+        // Case 1: Globstar is last segment - match files only here
+        // Directories are matched by their own skip items (which handle the case
+        // of globstar matching zero more levels), so we skip them to avoid duplicates.
+        if (next_idx >= self.pattern.segments.len) {
+            if (!self.shouldDescendInto(entry.kind)) {
+                // Only match files (non-directories)
                 const match_path = try self.buildPath(state.work_item.prefix, entry.name);
                 try self.pending_matches.append(.{
                     .path = match_path,
                     .kind = entry.kind,
                 });
-            } else if (self.shouldDescendInto(entry.kind)) {
-                // More segments to match, descend into directories (and symlinks if following)
+            }
+            // Directories will be handled by handleGlobstarEntry pushing work items
+            // and their own skip items returning them as matches
+            return;
+        }
+
+        // Case 2: More segments after globstar
+        // Only handle directory descent here. File matching is done by skip work items
+        // which are pushed in setupGlobstarIteration. This prevents duplicate matches
+        // for patterns like `**/*.zig`.
+        const next_segment = self.pattern.segments[next_idx];
+        if (self.matchesSegment(next_segment, entry.name)) {
+            // Only descend into directories when there are more segments to match
+            if (next_idx + 1 < self.pattern.segments.len and self.shouldDescendInto(entry.kind)) {
                 const new_prefix = try self.buildPath(state.work_item.prefix, entry.name);
                 errdefer self.allocator.free(new_prefix);
 
@@ -639,6 +647,7 @@ pub const Walker = struct {
                     .owns_dir = true,
                 });
             }
+            // File matches for `**/*.ext` are handled by skip items, not here
         }
     }
 
