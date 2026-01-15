@@ -222,10 +222,6 @@ fn hasGlobChars(s: []const u8) bool {
     return false;
 }
 
-fn writeOutput(fd: std.posix.fd_t, data: []const u8) void {
-    _ = std.posix.write(fd, data) catch {};
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -234,36 +230,36 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const stderr = std.posix.STDERR_FILENO;
-    const stdout = std.posix.STDOUT_FILENO;
+    const stderr = std.fs.File.stderr();
+    const stdout = std.fs.File.stdout();
 
     var opts = parseArgs(allocator, args) catch |err| {
         switch (err) {
-            ParseError.MissingArgument => writeOutput(stderr, "Error: Missing argument for option\n"),
-            ParseError.InvalidArgument => writeOutput(stderr, "Error: Invalid argument\n"),
-            ParseError.UnknownOption => writeOutput(stderr, "Error: Unknown option\n"),
-            else => writeOutput(stderr, "Error: Failed to parse arguments\n"),
+            ParseError.MissingArgument => stderr.writeAll("Error: Missing argument for option\n") catch {},
+            ParseError.InvalidArgument => stderr.writeAll("Error: Invalid argument\n") catch {},
+            ParseError.UnknownOption => stderr.writeAll("Error: Unknown option\n") catch {},
+            else => stderr.writeAll("Error: Failed to parse arguments\n") catch {},
         }
-        writeOutput(stderr, "Try 'zig-glob --help' for more information.\n");
+        stderr.writeAll("Try 'zig-glob --help' for more information.\n") catch {};
         std.process.exit(2);
     };
     defer opts.deinit();
 
     // Handle help/version
     if (opts.show_help) {
-        writeOutput(stdout, usage);
+        stdout.writeAll(usage) catch {};
         return;
     }
 
     if (opts.show_version) {
-        writeOutput(stdout, "zig-glob " ++ version ++ "\n");
+        stdout.writeAll("zig-glob " ++ version ++ "\n") catch {};
         return;
     }
 
     // Require at least one pattern
     if (opts.patterns.items.len == 0) {
-        writeOutput(stderr, "Error: No pattern specified\n");
-        writeOutput(stderr, "Try 'zig-glob --help' for more information.\n");
+        stderr.writeAll("Error: No pattern specified\n") catch {};
+        stderr.writeAll("Try 'zig-glob --help' for more information.\n") catch {};
         std.process.exit(2);
     }
 
@@ -292,7 +288,7 @@ pub fn main() !void {
         var iter = zig_glob.glob(allocator, opts.patterns.items, glob_opts) catch |err| {
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "Error: Failed to glob '{s}': {}\n", .{ base_path, err }) catch "Error: Failed to glob\n";
-            writeOutput(stderr, msg);
+            stderr.writeAll(msg) catch {};
             had_error = true;
             continue;
         };
@@ -301,7 +297,7 @@ pub fn main() !void {
         while (iter.next() catch |err| {
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "Error during traversal: {}\n", .{err}) catch "Error during traversal\n";
-            writeOutput(stderr, msg);
+            stderr.writeAll(msg) catch {};
             had_error = true;
             break;
         }) |entry| {
@@ -309,8 +305,8 @@ pub fn main() !void {
             total_count += 1;
 
             if (!opts.quiet and !opts.count_only) {
-                writeOutput(stdout, entry.path);
-                writeOutput(stdout, sep);
+                stdout.writeAll(entry.path) catch {};
+                stdout.writeAll(sep) catch {};
             }
         }
     }
@@ -319,7 +315,7 @@ pub fn main() !void {
     if (opts.count_only and !opts.quiet) {
         var buf: [32]u8 = undefined;
         const count_str = std.fmt.bufPrint(&buf, "{}\n", .{total_count}) catch "?\n";
-        writeOutput(stdout, count_str);
+        stdout.writeAll(count_str) catch {};
     }
 
     // Exit status
@@ -330,5 +326,3 @@ pub fn main() !void {
     }
     // Exit 0 on success (implicit)
 }
-
-// Tests removed - they were unrelated template tests
