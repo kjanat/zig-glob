@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            artifact: zig-glob-linux-x86_64
+          - target: aarch64-linux
+            artifact: zig-glob-linux-aarch64
+          - target: x86_64-macos
+            artifact: zig-glob-macos-x86_64
+          - target: aarch64-macos
+            artifact: zig-glob-macos-aarch64
+          - target: x86_64-windows
+            artifact: zig-glob-windows-x86_64
+            ext: .exe
+          - target: x86_64-freebsd
+            artifact: zig-glob-freebsd-x86_64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/zig-glob${{ matrix.ext || '' }} dist/${{ matrix.artifact }}${{ matrix.ext || '' }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}${{ matrix.ext || '' }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            cp "$dir"* release/
+          done
+          cd release
+          for f in *; do
+            if [[ ! "$f" == *.exe ]]; then
+              chmod +x "$f"
+            fi
+            sha256sum "$f" >> checksums.txt
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: zig-glob ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release/*
