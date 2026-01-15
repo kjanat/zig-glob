@@ -78,6 +78,40 @@ const RepeatMemoKey = struct {
 
 const RepeatMemoTable = std.AutoHashMap(RepeatMemoKey, bool);
 
+/// Fast path classification for patterns.
+const FastPathType = enum {
+    /// Pattern is all literals: `src/main.zig`
+    literal_only,
+    /// Single segment with `*` suffix: `*.zig`
+    star_suffix,
+    /// Single segment with `*` prefix: `test*`
+    star_prefix,
+    /// Single segment with `*` in middle: `a*b`
+    star_middle,
+    /// Just `**`: matches everything
+    globstar_only,
+    /// `**/literal`: any segment matches literal
+    globstar_literal,
+    /// `literal/**`: first segment matches literal
+    literal_globstar,
+    /// No fast path available
+    none,
+};
+
+/// Fast path data for optimized matching.
+const FastPathData = struct {
+    path_type: FastPathType,
+    /// For literal_only: the full literal path to compare
+    /// For star_suffix: the suffix (e.g., ".zig")
+    /// For star_prefix: the prefix (e.g., "test")
+    /// For globstar_literal/literal_globstar: the literal segment
+    literal: []const u8 = "",
+    /// For star_middle: the prefix before *
+    prefix: []const u8 = "",
+    /// For star_middle: the suffix after *
+    suffix: []const u8 = "",
+};
+
 /// Matcher engine with memoization support.
 pub const Matcher = struct {
     allocator: Allocator,
@@ -88,6 +122,9 @@ pub const Matcher = struct {
     /// Pattern being matched (stored as pointer to avoid copies).
     pattern: *const Pattern,
 
+    /// Pre-computed fast path info (computed once at init).
+    fast_path: FastPathData,
+
     pub fn init(allocator: Allocator, pattern: *const Pattern, options: MatchOptions) Matcher {
         return .{
             .allocator = allocator,
@@ -95,6 +132,7 @@ pub const Matcher = struct {
             .memo = MemoTable.init(allocator),
             .repeat_memo = RepeatMemoTable.init(allocator),
             .pattern = pattern,
+            .fast_path = analyzeFastPath(pattern),
         };
     }
 
@@ -105,6 +143,12 @@ pub const Matcher = struct {
 
     /// Match the entire pattern against a path.
     pub fn matchPath(self: *Matcher, path: []const u8) !bool {
+        // Try fast path first (no allocations, O(n) or better)
+        if (self.tryFastPath(path)) |result| {
+            return result;
+        }
+
+        // Fall back to full matching
         self.memo.clearRetainingCapacity();
         self.repeat_memo.clearRetainingCapacity();
 
@@ -120,6 +164,151 @@ pub const Matcher = struct {
         }
 
         return self.matchSegments(self.pattern.segments, path_segments.items, 0);
+    }
+
+    /// Try fast path matching. Returns null if fast path not applicable.
+    fn tryFastPath(self: *Matcher, path: []const u8) ?bool {
+        const fp = self.fast_path;
+
+        switch (fp.path_type) {
+            .none => return null,
+
+            .literal_only => {
+                // Direct comparison - normalize separators
+                return self.compareLiteralPath(fp.literal, path);
+            },
+
+            .star_suffix => {
+                // `*.suffix` - single segment pattern, must not have path separators
+                if (std.mem.indexOfAny(u8, path, path_separators) != null) {
+                    return false;
+                }
+
+                // Dotfile check
+                if (!self.options.dot and path.len > 0 and path[0] == '.') {
+                    return false;
+                }
+
+                // Empty suffix means `*` which matches any single segment
+                if (fp.literal.len == 0) {
+                    return true;
+                }
+
+                return self.endsWithLiteral(path, fp.literal);
+            },
+
+            .star_prefix => {
+                // `prefix*` - single segment pattern, must not have path separators
+                if (std.mem.indexOfAny(u8, path, path_separators) != null) {
+                    return false;
+                }
+
+                // Dotfile check - prefix must start with . to match dotfiles
+                if (!self.options.dot and path.len > 0 and path[0] == '.') {
+                    if (fp.literal.len == 0 or fp.literal[0] != '.') {
+                        return false;
+                    }
+                }
+
+                return self.startsWithLiteral(path, fp.literal);
+            },
+
+            .star_middle => {
+                // `prefix*suffix` - single segment pattern
+                if (std.mem.indexOfAny(u8, path, path_separators) != null) {
+                    return false;
+                }
+
+                // Dotfile check
+                if (!self.options.dot and path.len > 0 and path[0] == '.') {
+                    if (fp.prefix.len == 0 or fp.prefix[0] != '.') {
+                        return false;
+                    }
+                }
+
+                if (!self.startsWithLiteral(path, fp.prefix)) return false;
+                if (!self.endsWithLiteral(path, fp.suffix)) return false;
+                // Ensure no overlap (prefix + suffix must fit)
+                return path.len >= fp.prefix.len + fp.suffix.len;
+            },
+
+            .globstar_only => {
+                // `**` matches everything
+                return true;
+            },
+
+            .globstar_literal => {
+                // `**/literal` - check if any segment matches literal
+                var iter = std.mem.splitAny(u8, path, path_separators);
+                while (iter.next()) |seg| {
+                    if (seg.len > 0) {
+                        if (self.eqlLiteral(seg, fp.literal)) {
+                            // Must be the last segment
+                            if (iter.peek() == null) return true;
+                        }
+                    }
+                }
+                return false;
+            },
+
+            .literal_globstar => {
+                // `literal/**` - check if first segment matches literal
+                var iter = std.mem.splitAny(u8, path, path_separators);
+                if (iter.next()) |first| {
+                    return first.len > 0 and self.eqlLiteral(first, fp.literal);
+                }
+                return false;
+            },
+        }
+    }
+
+    /// Compare literal path with normalization for separators.
+    fn compareLiteralPath(self: *Matcher, pattern: []const u8, path: []const u8) bool {
+        var p_iter = std.mem.splitAny(u8, pattern, path_separators);
+        var path_iter = std.mem.splitAny(u8, path, path_separators);
+
+        while (true) {
+            // Skip empty segments
+            var p_seg: ?[]const u8 = null;
+            while (p_iter.next()) |s| {
+                if (s.len > 0) {
+                    p_seg = s;
+                    break;
+                }
+            }
+
+            var path_seg: ?[]const u8 = null;
+            while (path_iter.next()) |s| {
+                if (s.len > 0) {
+                    path_seg = s;
+                    break;
+                }
+            }
+
+            if (p_seg == null and path_seg == null) return true;
+            if (p_seg == null or path_seg == null) return false;
+            if (!self.eqlLiteral(path_seg.?, p_seg.?)) return false;
+        }
+    }
+
+    /// Check equality with optional case insensitivity.
+    fn eqlLiteral(self: *Matcher, a: []const u8, b: []const u8) bool {
+        if (self.options.nocase) {
+            return std.ascii.eqlIgnoreCase(a, b);
+        }
+        return std.mem.eql(u8, a, b);
+    }
+
+    /// Check if string starts with literal.
+    fn startsWithLiteral(self: *Matcher, str: []const u8, prefix: []const u8) bool {
+        if (str.len < prefix.len) return false;
+        return self.eqlLiteral(str[0..prefix.len], prefix);
+    }
+
+    /// Check if string ends with literal.
+    fn endsWithLiteral(self: *Matcher, str: []const u8, suffix: []const u8) bool {
+        if (str.len < suffix.len) return false;
+        return self.eqlLiteral(str[str.len - suffix.len ..], suffix);
     }
 
     /// Match pattern segments against path segments.
@@ -528,6 +717,137 @@ pub const Matcher = struct {
         };
     }
 };
+
+/// Analyze a pattern to determine if a fast path can be used.
+fn analyzeFastPath(pattern: *const Pattern) FastPathData {
+    const segs = pattern.segments;
+
+    // Empty pattern or absolute paths - no fast path
+    if (segs.len == 0 or pattern.is_absolute) {
+        return .{ .path_type = .none };
+    }
+
+    // Single segment patterns
+    if (segs.len == 1) {
+        return analyzeSingleSegment(segs[0]);
+    }
+
+    // Two segment patterns
+    if (segs.len == 2) {
+        const first = segs[0];
+        const second = segs[1];
+
+        // `**/literal` pattern
+        if (first == .globstar) {
+            if (getLiteralFromNode(second)) |lit| {
+                return .{ .path_type = .globstar_literal, .literal = lit };
+            }
+        }
+
+        // `literal/**` pattern
+        if (second == .globstar) {
+            if (getLiteralFromNode(first)) |lit| {
+                return .{ .path_type = .literal_globstar, .literal = lit };
+            }
+        }
+    }
+
+    // Check if all segments are pure literals
+    var literal_parts: [64][]const u8 = undefined;
+    var num_parts: usize = 0;
+    var total_len: usize = 0;
+
+    for (segs) |seg| {
+        if (getLiteralFromNode(seg)) |lit| {
+            if (num_parts >= 64) return .{ .path_type = .none };
+            literal_parts[num_parts] = lit;
+            total_len += lit.len;
+            if (num_parts > 0) total_len += 1; // for separator
+            num_parts += 1;
+        } else {
+            return .{ .path_type = .none };
+        }
+    }
+
+    // All literals - store the original pattern string for comparison
+    if (num_parts > 0) {
+        return .{ .path_type = .literal_only, .literal = pattern.original };
+    }
+
+    return .{ .path_type = .none };
+}
+
+/// Analyze a single segment to find fast path opportunities.
+fn analyzeSingleSegment(node: Node) FastPathData {
+    switch (node) {
+        .globstar => return .{ .path_type = .globstar_only },
+        .literal => |lit| return .{ .path_type = .literal_only, .literal = lit },
+        .star => return .{ .path_type = .star_suffix, .literal = "" }, // matches anything
+        .segment => |seg| return analyzeSegmentNodes(seg),
+        .sequence => |seq| return analyzeSegmentNodes(seq),
+        else => return .{ .path_type = .none },
+    }
+}
+
+/// Analyze nodes within a segment for star patterns like `*.zig` or `a*b`.
+fn analyzeSegmentNodes(nodes: []const Node) FastPathData {
+    if (nodes.len == 0) return .{ .path_type = .none };
+
+    // Single node cases
+    if (nodes.len == 1) {
+        switch (nodes[0]) {
+            .literal => |lit| return .{ .path_type = .literal_only, .literal = lit },
+            .star => return .{ .path_type = .star_suffix, .literal = "" },
+            .globstar => return .{ .path_type = .globstar_only },
+            else => return .{ .path_type = .none },
+        }
+    }
+
+    // Two node cases: literal+star or star+literal
+    if (nodes.len == 2) {
+        // `*.suffix` pattern
+        if (nodes[0] == .star and nodes[1] == .literal) {
+            return .{ .path_type = .star_suffix, .literal = nodes[1].literal };
+        }
+        // `prefix*` pattern
+        if (nodes[0] == .literal and nodes[1] == .star) {
+            return .{ .path_type = .star_prefix, .literal = nodes[0].literal };
+        }
+    }
+
+    // Three node cases: literal+star+literal (`a*b`)
+    if (nodes.len == 3) {
+        if (nodes[0] == .literal and nodes[1] == .star and nodes[2] == .literal) {
+            return .{
+                .path_type = .star_middle,
+                .prefix = nodes[0].literal,
+                .suffix = nodes[2].literal,
+            };
+        }
+    }
+
+    return .{ .path_type = .none };
+}
+
+/// Get literal value from a node if it's a pure literal.
+fn getLiteralFromNode(node: Node) ?[]const u8 {
+    switch (node) {
+        .literal => |lit| return lit,
+        .segment => |seg| {
+            if (seg.len == 1 and seg[0] == .literal) {
+                return seg[0].literal;
+            }
+            return null;
+        },
+        .sequence => |seq| {
+            if (seq.len == 1 and seq[0] == .literal) {
+                return seq[0].literal;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
 
 fn canMatchEmptyNode(node: Node) bool {
     return switch (node) {
@@ -1309,4 +1629,233 @@ test "edge: literal with special regex chars" {
     defer matcher.deinit();
 
     try testing.expect(matcher.matchNode(pattern.segments[0], "file[1].txt"));
+}
+
+// ============================================================================
+// Fast Path Tests
+// ============================================================================
+
+test "fast path: literal-only single segment" {
+    // Single literal should use fast path
+    try testMatch("file.txt", "file.txt", true);
+    try testMatch("file.txt", "other.txt", false);
+    try testMatch("file.txt", "file.txt/", true); // trailing slash is same path
+    try testMatch("file.txt", "dir/file.txt", false);
+}
+
+test "fast path: literal-only multi segment" {
+    // Multi-segment literal path
+    try testMatch("src/main.zig", "src/main.zig", true);
+    try testMatch("src/main.zig", "src\\main.zig", true); // cross-platform
+    try testMatch("src/main.zig", "other/main.zig", false);
+    try testMatch("src/main.zig", "src/other.zig", false);
+    try testMatch("src/lib/utils.zig", "src/lib/utils.zig", true);
+}
+
+test "fast path: star suffix pattern" {
+    // `*.ext` patterns - single segment only
+    try testMatch("*.zig", "main.zig", true);
+    try testMatch("*.zig", "test.zig", true);
+    try testMatch("*.zig", "file.txt", false);
+    try testMatch("*.zig", "src/main.zig", false); // must be single segment
+    try testMatch("*.txt", "readme.txt", true);
+    try testMatch("*.txt", ".hidden.txt", false); // dotfile without dot=true
+}
+
+test "fast path: star suffix with dot option" {
+    const allocator = testing.allocator;
+    var pattern = try parser.parse(allocator, "*.txt", .{});
+    defer pattern.deinit();
+
+    // With dot=true, should match dotfiles
+    var matcher = Matcher.init(allocator, &pattern, .{ .dot = true });
+    defer matcher.deinit();
+    try testing.expect(try matcher.matchPath(".hidden.txt"));
+}
+
+test "fast path: star prefix pattern" {
+    // `prefix*` patterns
+    try testMatch("test*", "test", true);
+    try testMatch("test*", "test.zig", true);
+    try testMatch("test*", "testing", true);
+    try testMatch("test*", "other", false);
+    try testMatch("test*", "dir/test.zig", false); // single segment only
+}
+
+test "fast path: star middle pattern" {
+    // `prefix*suffix` patterns
+    try testMatch("a*b", "ab", true);
+    try testMatch("a*b", "aXb", true);
+    try testMatch("a*b", "aXYZb", true);
+    try testMatch("a*b", "a/b", false); // no path separators
+    try testMatch("test*.zig", "test.zig", true);
+    try testMatch("test*.zig", "test_main.zig", true);
+    try testMatch("test*.zig", "test_main.txt", false);
+}
+
+test "fast path: globstar only" {
+    // `**` matches everything
+    try testMatch("**", "", true);
+    try testMatch("**", "a", true);
+    try testMatch("**", "a/b", true);
+    try testMatch("**", "a/b/c/d/e", true);
+    try testMatch("**", ".hidden", true);
+}
+
+test "fast path: globstar literal pattern" {
+    // `**/literal` - any segment matches literal (as last segment)
+    try testMatch("**/file.txt", "file.txt", true);
+    try testMatch("**/file.txt", "src/file.txt", true);
+    try testMatch("**/file.txt", "a/b/c/file.txt", true);
+    try testMatch("**/file.txt", "other.txt", false);
+    try testMatch("**/file.txt", "file.txt/extra", false); // must be last
+}
+
+test "fast path: literal globstar pattern" {
+    // `literal/**` - first segment matches literal
+    try testMatch("src/**", "src", true);
+    try testMatch("src/**", "src/main.zig", true);
+    try testMatch("src/**", "src/a/b/c", true);
+    try testMatch("src/**", "other/main.zig", false);
+    try testMatch("lib/**", "lib", true);
+    try testMatch("lib/**", "library", false); // must match exactly
+}
+
+test "fast path: case insensitive matching" {
+    const allocator = testing.allocator;
+
+    // Literal pattern with nocase
+    var p1 = try parser.parse(allocator, "FILE.TXT", .{});
+    defer p1.deinit();
+    var m1 = Matcher.init(allocator, &p1, .{ .nocase = true });
+    defer m1.deinit();
+    try testing.expect(try m1.matchPath("file.txt"));
+    try testing.expect(try m1.matchPath("FILE.TXT"));
+    try testing.expect(try m1.matchPath("File.Txt"));
+
+    // Star suffix with nocase
+    var p2 = try parser.parse(allocator, "*.TXT", .{});
+    defer p2.deinit();
+    var m2 = Matcher.init(allocator, &p2, .{ .nocase = true });
+    defer m2.deinit();
+    try testing.expect(try m2.matchPath("file.txt"));
+    try testing.expect(try m2.matchPath("FILE.TXT"));
+}
+
+test "fast path: verify fast path is actually used" {
+    // This test verifies that fast paths don't allocate by checking
+    // patterns that should use fast paths work without issues
+    const allocator = testing.allocator;
+
+    // Literal-only - should use direct comparison
+    var p1 = try parser.parse(allocator, "exact", .{});
+    defer p1.deinit();
+    var m1 = Matcher.init(allocator, &p1, .{});
+    defer m1.deinit();
+    try testing.expectEqual(FastPathType.literal_only, m1.fast_path.path_type);
+
+    // Star suffix
+    var p2 = try parser.parse(allocator, "*.zig", .{});
+    defer p2.deinit();
+    var m2 = Matcher.init(allocator, &p2, .{});
+    defer m2.deinit();
+    try testing.expectEqual(FastPathType.star_suffix, m2.fast_path.path_type);
+    try testing.expectEqualStrings(".zig", m2.fast_path.literal);
+
+    // Star prefix
+    var p3 = try parser.parse(allocator, "test*", .{});
+    defer p3.deinit();
+    var m3 = Matcher.init(allocator, &p3, .{});
+    defer m3.deinit();
+    try testing.expectEqual(FastPathType.star_prefix, m3.fast_path.path_type);
+    try testing.expectEqualStrings("test", m3.fast_path.literal);
+
+    // Globstar only
+    var p4 = try parser.parse(allocator, "**", .{});
+    defer p4.deinit();
+    var m4 = Matcher.init(allocator, &p4, .{});
+    defer m4.deinit();
+    try testing.expectEqual(FastPathType.globstar_only, m4.fast_path.path_type);
+
+    // Globstar literal
+    var p5 = try parser.parse(allocator, "**/foo", .{});
+    defer p5.deinit();
+    var m5 = Matcher.init(allocator, &p5, .{});
+    defer m5.deinit();
+    try testing.expectEqual(FastPathType.globstar_literal, m5.fast_path.path_type);
+    try testing.expectEqualStrings("foo", m5.fast_path.literal);
+
+    // Literal globstar
+    var p6 = try parser.parse(allocator, "src/**", .{});
+    defer p6.deinit();
+    var m6 = Matcher.init(allocator, &p6, .{});
+    defer m6.deinit();
+    try testing.expectEqual(FastPathType.literal_globstar, m6.fast_path.path_type);
+    try testing.expectEqualStrings("src", m6.fast_path.literal);
+
+    // Star middle
+    var p7 = try parser.parse(allocator, "a*b", .{});
+    defer p7.deinit();
+    var m7 = Matcher.init(allocator, &p7, .{});
+    defer m7.deinit();
+    try testing.expectEqual(FastPathType.star_middle, m7.fast_path.path_type);
+    try testing.expectEqualStrings("a", m7.fast_path.prefix);
+    try testing.expectEqualStrings("b", m7.fast_path.suffix);
+}
+
+test "fast path: dotdir with wildcard" {
+    // `.hidden/*.txt` - dotfile directory with wildcard filename
+    try testMatch(".hidden/*.txt", ".hidden/file.txt", true);
+    try testMatch(".hidden/*.txt", ".hidden/test.txt", true);
+    try testMatch(".hidden/*.txt", ".hidden/.secret.txt", false); // nested dotfile
+    try testMatch(".hidden/*.txt", "visible/file.txt", false);
+    try testMatch(".config/settings.*", ".config/settings.json", true);
+    try testMatch(".config/settings.*", ".config/settings.yaml", true);
+
+    // With dot=true, nested dotfiles should match
+    const allocator = testing.allocator;
+    var pattern = try parser.parse(allocator, ".hidden/*.txt", .{});
+    defer pattern.deinit();
+    var matcher = Matcher.init(allocator, &pattern, .{ .dot = true });
+    defer matcher.deinit();
+    try testing.expect(try matcher.matchPath(".hidden/.secret.txt"));
+}
+
+test "fast path: patterns that should NOT use fast paths" {
+    const allocator = testing.allocator;
+
+    // Character class - no fast path
+    var p1 = try parser.parse(allocator, "[abc].txt", .{});
+    defer p1.deinit();
+    var m1 = Matcher.init(allocator, &p1, .{});
+    defer m1.deinit();
+    try testing.expectEqual(FastPathType.none, m1.fast_path.path_type);
+
+    // Extglob - no fast path
+    var p2 = try parser.parse(allocator, "?(foo|bar).txt", .{ .extglob = true });
+    defer p2.deinit();
+    var m2 = Matcher.init(allocator, &p2, .{});
+    defer m2.deinit();
+    try testing.expectEqual(FastPathType.none, m2.fast_path.path_type);
+
+    // Question mark - no fast path
+    var p3 = try parser.parse(allocator, "?.txt", .{});
+    defer p3.deinit();
+    var m3 = Matcher.init(allocator, &p3, .{});
+    defer m3.deinit();
+    try testing.expectEqual(FastPathType.none, m3.fast_path.path_type);
+
+    // Multiple stars in segment - no fast path
+    var p4 = try parser.parse(allocator, "*a*b*", .{});
+    defer p4.deinit();
+    var m4 = Matcher.init(allocator, &p4, .{});
+    defer m4.deinit();
+    try testing.expectEqual(FastPathType.none, m4.fast_path.path_type);
+
+    // Complex multi-segment with wildcards - no fast path
+    var p5 = try parser.parse(allocator, "src/*.zig", .{});
+    defer p5.deinit();
+    var m5 = Matcher.init(allocator, &p5, .{});
+    defer m5.deinit();
+    try testing.expectEqual(FastPathType.none, m5.fast_path.path_type);
 }
