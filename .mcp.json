@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "zig-docs": {
+      "command": "bunx",
+      "args": [
+        "zig-mcp@latest",
+        "--doc-source",
+        "remote",
+        "--version",
+        "0.15.2"
+      ]
+    }
+  }
+}

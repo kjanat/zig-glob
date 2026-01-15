@@ -6,10 +6,10 @@
   "malva": {},
   "markup": {},
   "yaml": {},
-  "zig": {},
   "excludes": [
     "**/node_modules",
     "**/*-lock.json",
+    "**/.zig-cache",
   ],
   "plugins": [
     "https://plugins.dprint.dev/typescript-0.95.13.wasm",
@@ -19,6 +19,6 @@
     "https://plugins.dprint.dev/g-plane/malva-v0.15.1.wasm",
     "https://plugins.dprint.dev/g-plane/markup_fmt-v0.25.3.wasm",
     "https://plugins.dprint.dev/g-plane/pretty_yaml-v0.6.0.wasm",
-    "https://plugins.dprint.dev/kjanat/zig-0.2.1.wasm",
+    // "https://plugins.dprint.dev/kjanat/zig-0.2.1.wasm",
   ],
 }

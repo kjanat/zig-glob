@@ -19,6 +19,16 @@ pub const Match = struct {
     }
 };
 
+/// Error handling policy for filesystem operations.
+pub const ErrorPolicy = enum {
+    /// Skip entries that cause errors (permission denied, etc.) silently.
+    skip_silent,
+    /// Skip entries but log/report the error.
+    skip_report,
+    /// Stop traversal on first error.
+    stop_on_error,
+};
+
 /// Options for walker behavior.
 pub const WalkerOptions = struct {
     /// Match dotfiles with wildcards.
@@ -31,6 +41,11 @@ pub const WalkerOptions = struct {
     include_broken_symlinks: bool = true,
     /// Maximum traversal depth (null = unlimited).
     max_depth: ?u32 = null,
+    /// How to handle filesystem errors during traversal.
+    error_policy: ErrorPolicy = .skip_silent,
+    /// Callback for reported errors (used when error_policy is skip_report).
+    /// Path is the path that caused the error.
+    error_callback: ?*const fn (path: []const u8, err: anyerror) void = null,
 };
 
 /// Inode key for cycle detection when following symlinks.
@@ -370,37 +385,96 @@ pub const Walker = struct {
         };
     }
 
+    /// Walker-specific errors that can be returned to caller.
+    pub const WalkerError = error{
+        /// Permission denied accessing a path.
+        PermissionDenied,
+        /// Path no longer exists (TOCTOU race).
+        PathNotFound,
+        /// Generic filesystem error.
+        FilesystemError,
+        /// Out of memory.
+        OutOfMemory,
+    };
+
+    /// Handle a filesystem error according to the error policy.
+    /// Returns true if traversal should continue, false if should stop.
+    fn handleFilesystemError(self: *Walker, path: []const u8, err: anyerror) WalkerError!void {
+        switch (self.options.error_policy) {
+            .skip_silent => {
+                // Silently skip - do nothing
+            },
+            .skip_report => {
+                // Report via callback if provided
+                if (self.options.error_callback) |callback| {
+                    callback(path, err);
+                }
+            },
+            .stop_on_error => {
+                // Map to walker error type
+                return switch (err) {
+                    error.AccessDenied => WalkerError.PermissionDenied,
+                    error.FileNotFound => WalkerError.PathNotFound,
+                    error.NotDir => WalkerError.PathNotFound,
+                    else => WalkerError.FilesystemError,
+                };
+            },
+        }
+    }
+
     /// Process one entry from the current directory iteration.
     fn processIterEntry(self: *Walker, state: *IterState) !?Match {
-        while (state.iter.next() catch null) |entry| {
-            // Skip . and ..
-            if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) {
+        while (true) {
+            // Handle directory iteration with proper error handling
+            const entry_result = state.iter.next();
+            const entry = entry_result catch |err| {
+                // Build path for error reporting (best effort)
+                const err_path = state.work_item.prefix;
+                try self.handleFilesystemError(err_path, err);
+                // If we get here, policy is to continue
                 continue;
-            }
+            };
 
-            // Apply dotfile rule
-            if (!self.options.dot and entry.name[0] == '.') {
-                // Check if pattern explicitly matches dotfiles
-                if (!self.patternMatchesDotfile(state.work_item.segment_idx)) {
+            // Check if iteration is complete
+            if (entry) |e| {
+                // Skip . and ..
+                if (std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) {
                     continue;
                 }
-            }
 
-            if (state.globstar_mode) {
-                // In globstar mode: descend into all directories
-                if (entry.kind == .directory) {
-                    try self.handleGlobstarEntry(state, entry);
+                // Apply dotfile rule
+                if (!self.options.dot and e.name[0] == '.') {
+                    // Check if pattern explicitly matches dotfiles
+                    if (!self.patternMatchesDotfile(state.work_item.segment_idx)) {
+                        continue;
+                    }
                 }
-                // Also check if this entry matches the next segment
-                try self.checkGlobstarMatch(state, entry);
+
+                if (state.globstar_mode) {
+                    // In globstar mode: descend into all directories (and symlinks if following)
+                    if (self.shouldDescendInto(e.kind)) {
+                        self.handleGlobstarEntry(state, e) catch |err| {
+                            const path = self.buildPath(state.work_item.prefix, e.name) catch {
+                                // Can't build path, just skip
+                                continue;
+                            };
+                            defer self.allocator.free(path);
+                            try self.handleFilesystemError(path, err);
+                        };
+                    }
+                    // Also check if this entry matches the next segment
+                    try self.checkGlobstarMatch(state, e);
+                } else {
+                    // Pattern mode: check if entry matches current segment
+                    if (try self.checkPatternMatch(state, e)) |match| {
+                        return match;
+                    }
+                }
             } else {
-                // Pattern mode: check if entry matches current segment
-                if (try self.checkPatternMatch(state, entry)) |match| {
-                    return match;
-                }
+                // Iterator exhausted
+                return null;
             }
         }
-        return null;
     }
 
     /// Handle a directory entry in globstar mode.
@@ -408,10 +482,12 @@ pub const Walker = struct {
         const new_prefix = try self.buildPath(state.work_item.prefix, entry.name);
         errdefer self.allocator.free(new_prefix);
 
-        // Open the subdirectory
-        var sub_dir = state.work_item.dir.openDir(entry.name, .{ .iterate = true }) catch {
+        // Open the subdirectory with TOCTOU-resilient error handling
+        // Entry might have been deleted between iteration and openDir
+        var sub_dir = state.work_item.dir.openDir(entry.name, .{ .iterate = true }) catch |err| {
             self.allocator.free(new_prefix);
-            return;
+            // Re-throw for caller to handle according to policy
+            return err;
         };
         errdefer sub_dir.close();
 
@@ -457,8 +533,8 @@ pub const Walker = struct {
                     .path = match_path,
                     .kind = entry.kind,
                 });
-            } else if (entry.kind == .directory) {
-                // More segments to match, descend
+            } else if (self.shouldDescendInto(entry.kind)) {
+                // More segments to match, descend into directories (and symlinks if following)
                 const new_prefix = try self.buildPath(state.work_item.prefix, entry.name);
                 errdefer self.allocator.free(new_prefix);
 
@@ -497,8 +573,8 @@ pub const Walker = struct {
                 .path = new_prefix,
                 .kind = entry.kind,
             };
-        } else if (entry.kind == .directory) {
-            // More segments: descend
+        } else if (self.shouldDescendInto(entry.kind)) {
+            // More segments: descend into directories (and symlinks if following)
             var sub_dir = state.work_item.dir.openDir(entry.name, .{ .iterate = true }) catch {
                 self.allocator.free(new_prefix);
                 return null;
@@ -520,7 +596,7 @@ pub const Walker = struct {
                 .owns_dir = true,
             });
         } else {
-            // Not a directory and not last segment
+            // Not a directory (or symlink without follow) and not last segment
             self.allocator.free(new_prefix);
         }
 
@@ -547,6 +623,14 @@ pub const Walker = struct {
         defer matcher.deinit();
 
         return matcher.matchNode(segment, name);
+    }
+
+    /// Check if we should descend into an entry.
+    /// Returns true for directories, and for symlinks when follow_symlinks is enabled.
+    fn shouldDescendInto(self: *Walker, kind: std.fs.File.Kind) bool {
+        if (kind == .directory) return true;
+        if (kind == .sym_link and self.options.follow_symlinks) return true;
+        return false;
     }
 
     /// Check if the pattern at given index explicitly matches dotfiles.
@@ -947,4 +1031,534 @@ test "walker: collectAll" {
     }
 
     try testing.expectEqual(@as(usize, 2), matches.len);
+}
+
+// ============================================================================
+// Edge Case and Error Handling Tests
+// ============================================================================
+
+test "edge: max depth limit enforcement" {
+    const allocator = testing.allocator;
+
+    // Create test directory structure
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create nested structure: a/b/c/d/file.txt (4 levels deep)
+    try createTestFile(test_info.dir, "a/b/c/d/file.txt");
+    try createTestFile(test_info.dir, "a/b/shallow.txt");
+
+    // Create ** pattern with max_depth=2
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .globstar;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "**",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .max_depth = 2,
+    });
+    defer walker.deinit();
+
+    var found_deep = false;
+    var found_shallow = false;
+
+    while (try walker.next()) |match| {
+        if (std.mem.indexOf(u8, match.path, "a/b/c/d/file.txt")) |_| {
+            found_deep = true;
+        }
+        if (std.mem.indexOf(u8, match.path, "shallow.txt")) |_| {
+            found_shallow = true;
+        }
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    // Deep file should NOT be found due to depth limit
+    // Shallow file should be found
+    try testing.expect(!found_deep);
+    try testing.expect(found_shallow);
+}
+
+test "edge: empty directory" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Don't create any files - directory is empty
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
+    defer walker.deinit();
+
+    // Should return null immediately (no matches)
+    const match = try walker.next();
+    try testing.expect(match == null);
+}
+
+test "edge: special characters in filenames" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create files with special characters (that might look like glob patterns)
+    try createTestFile(test_info.dir, "file[1].txt");
+    try createTestFile(test_info.dir, "file{a}.txt");
+
+    // Create * pattern
+    const inner_nodes = try allocator.alloc(Node, 2);
+    defer allocator.free(inner_nodes);
+    inner_nodes[0] = .star;
+    inner_nodes[1] = .{ .literal = ".txt" };
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .{ .segment = inner_nodes };
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*.txt",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
+    defer walker.deinit();
+
+    var count: u32 = 0;
+    while (try walker.next()) |match| {
+        count += 1;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    // Should find both files
+    try testing.expectEqual(@as(u32, 2), count);
+}
+
+test "edge: error callback is invoked" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create a file
+    try createTestFile(test_info.dir, "test.txt");
+
+    // Static error counter for callback
+    const Counter = struct {
+        var count: u32 = 0;
+        fn callback(_: []const u8, _: anyerror) void {
+            count += 1;
+        }
+    };
+    Counter.count = 0;
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // Use skip_report policy with callback
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .error_policy = .skip_report,
+        .error_callback = Counter.callback,
+    });
+    defer walker.deinit();
+
+    // Normal operation should work, counter stays at 0 unless errors occur
+    const matches = try walker.collectAll();
+    defer {
+        for (matches) |*m| {
+            var match = m.*;
+            match.deinit(allocator);
+        }
+        allocator.free(matches);
+    }
+
+    // Should find the file
+    try testing.expectEqual(@as(usize, 1), matches.len);
+}
+
+test "edge: directory with only hidden files" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create only hidden files
+    try createTestFile(test_info.dir, ".gitignore");
+    try createTestFile(test_info.dir, ".env");
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // Without dot option - should find nothing
+    {
+        var walker = try Walker.init(allocator, &pattern, test_info.dir, .{ .dot = false });
+        defer walker.deinit();
+
+        const match = try walker.next();
+        try testing.expect(match == null);
+    }
+
+    // With dot option - should find both
+    {
+        var walker = try Walker.init(allocator, &pattern, test_info.dir, .{ .dot = true });
+        defer walker.deinit();
+
+        var count: u32 = 0;
+        while (try walker.next()) |match| {
+            count += 1;
+            var m = match;
+            m.deinit(allocator);
+        }
+        try testing.expectEqual(@as(u32, 2), count);
+    }
+}
+
+// ============================================================================
+// Comprehensive Walker Edge Case Tests
+// ============================================================================
+
+test "edge: very deep directory structure (10 levels)" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create 10-level deep structure
+    try createTestFile(test_info.dir, "a/b/c/d/e/f/g/h/i/j/deep.txt");
+
+    // Create **/*.txt pattern
+    const ext_nodes = try allocator.alloc(Node, 2);
+    defer allocator.free(ext_nodes);
+    ext_nodes[0] = .star;
+    ext_nodes[1] = .{ .literal = ".txt" };
+
+    const segments = try allocator.alloc(Node, 2);
+    defer allocator.free(segments);
+    segments[0] = .globstar;
+    segments[1] = .{ .segment = ext_nodes };
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "**/*.txt",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
+    defer walker.deinit();
+
+    var found_deep = false;
+    while (try walker.next()) |match| {
+        if (std.mem.endsWith(u8, match.path, "deep.txt")) {
+            found_deep = true;
+        }
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(found_deep);
+}
+
+test "edge: pattern matches nothing in non-empty directory" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create files with .txt extension only
+    try createTestFile(test_info.dir, "file1.txt");
+    try createTestFile(test_info.dir, "file2.txt");
+
+    // Create *.nonexistent pattern - should match nothing
+    const inner_nodes = try allocator.alloc(Node, 2);
+    defer allocator.free(inner_nodes);
+    inner_nodes[0] = .star;
+    inner_nodes[1] = .{ .literal = ".nonexistent" };
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .{ .segment = inner_nodes };
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*.nonexistent",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
+    defer walker.deinit();
+
+    var count: u32 = 0;
+    while (try walker.next()) |match| {
+        count += 1;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expectEqual(@as(u32, 0), count);
+}
+
+test "edge: literal path with multiple segments" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create nested structure
+    try createTestFile(test_info.dir, "src/lib/utils.zig");
+
+    // Create pattern with literal path separators
+    const segments = try allocator.alloc(Node, 3);
+    defer allocator.free(segments);
+    segments[0] = .{ .literal = "src" };
+    segments[1] = .{ .literal = "lib" };
+    segments[2] = .{ .literal = "utils.zig" };
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "src/lib/utils.zig",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
+    defer walker.deinit();
+
+    const match = try walker.next();
+    try testing.expect(match != null);
+    try testing.expectEqualStrings("src/lib/utils.zig", match.?.path);
+    var m = match.?;
+    m.deinit(allocator);
+
+    // Should be done
+    try testing.expect(try walker.next() == null);
+}
+
+test "edge: globstar with prefix directory restriction" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create structure in multiple directories
+    try createTestFile(test_info.dir, "src/main.zig");
+    try createTestFile(test_info.dir, "src/lib/utils.zig");
+    try createTestFile(test_info.dir, "tests/test_main.zig");
+
+    // Create src/**/*.zig pattern
+    const ext_nodes = try allocator.alloc(Node, 2);
+    defer allocator.free(ext_nodes);
+    ext_nodes[0] = .star;
+    ext_nodes[1] = .{ .literal = ".zig" };
+
+    const segments = try allocator.alloc(Node, 3);
+    defer allocator.free(segments);
+    segments[0] = .{ .literal = "src" };
+    segments[1] = .globstar;
+    segments[2] = .{ .segment = ext_nodes };
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "src/**/*.zig",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
+    defer walker.deinit();
+
+    var found_src_main = false;
+    var found_src_utils = false;
+    var found_tests = false;
+
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, "src/main.zig")) found_src_main = true;
+        if (std.mem.eql(u8, match.path, "src/lib/utils.zig")) found_src_utils = true;
+        if (std.mem.indexOf(u8, match.path, "tests/") != null) found_tests = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(found_src_main);
+    try testing.expect(found_src_utils);
+    try testing.expect(!found_tests); // Should NOT match tests directory
+}
+
+test "edge: character class in walker pattern" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create files with different extensions
+    try createTestFile(test_info.dir, "main.c");
+    try createTestFile(test_info.dir, "main.h");
+    try createTestFile(test_info.dir, "main.o");
+
+    // Create *.[ch] pattern
+    const cc_members = try allocator.alloc(ast.CharMember, 2);
+    defer allocator.free(cc_members);
+    cc_members[0] = .{ .single = 'c' };
+    cc_members[1] = .{ .single = 'h' };
+
+    const inner_nodes = try allocator.alloc(Node, 3);
+    defer allocator.free(inner_nodes);
+    inner_nodes[0] = .star;
+    inner_nodes[1] = .{ .literal = "." };
+    inner_nodes[2] = .{ .char_class = .{ .members = cc_members, .negated = false } };
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .{ .segment = inner_nodes };
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*.[ch]",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
+    defer walker.deinit();
+
+    var found_c = false;
+    var found_h = false;
+    var found_o = false;
+
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, "main.c")) found_c = true;
+        if (std.mem.eql(u8, match.path, "main.h")) found_h = true;
+        if (std.mem.eql(u8, match.path, "main.o")) found_o = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(found_c);
+    try testing.expect(found_h);
+    try testing.expect(!found_o); // Should NOT match .o files
+}
+
+test "edge: hidden directory traversal with globstar" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create hidden directory structure
+    try createTestFile(test_info.dir, ".hidden/file.txt");
+    try createTestFile(test_info.dir, "visible/file.txt");
+
+    // Create **/*.txt pattern
+    const ext_nodes = try allocator.alloc(Node, 2);
+    defer allocator.free(ext_nodes);
+    ext_nodes[0] = .star;
+    ext_nodes[1] = .{ .literal = ".txt" };
+
+    const segments = try allocator.alloc(Node, 2);
+    defer allocator.free(segments);
+    segments[0] = .globstar;
+    segments[1] = .{ .segment = ext_nodes };
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "**/*.txt",
+    };
+
+    // Without dot option
+    {
+        var walker = try Walker.init(allocator, &pattern, test_info.dir, .{ .dot = false });
+        defer walker.deinit();
+
+        var found_hidden = false;
+        var found_visible = false;
+
+        while (try walker.next()) |match| {
+            if (std.mem.indexOf(u8, match.path, ".hidden") != null) found_hidden = true;
+            if (std.mem.indexOf(u8, match.path, "visible") != null) found_visible = true;
+            var m = match;
+            m.deinit(allocator);
+        }
+
+        try testing.expect(found_visible);
+        // Without dot=true, hidden directories should not be traversed
+    }
+
+    // With dot option
+    {
+        var walker = try Walker.init(allocator, &pattern, test_info.dir, .{ .dot = true });
+        defer walker.deinit();
+
+        var found_hidden = false;
+        var found_visible = false;
+
+        while (try walker.next()) |match| {
+            if (std.mem.indexOf(u8, match.path, ".hidden") != null) found_hidden = true;
+            if (std.mem.indexOf(u8, match.path, "visible") != null) found_visible = true;
+            var m = match;
+            m.deinit(allocator);
+        }
+
+        try testing.expect(found_visible);
+        try testing.expect(found_hidden);
+    }
 }

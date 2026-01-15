@@ -11,20 +11,29 @@
 //! ## Quick Start
 //!
 //! ```zig
+//! const std = @import("std");
 //! const glob = @import("zig_glob");
 //!
-//! // Match a pattern against a path
-//! const matches = try glob.match("**/*.zig", "src/main.zig", .{});
+//! pub fn main() !void {
+//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//!     defer _ = gpa.deinit();
+//!     const allocator = gpa.allocator();
 //!
-//! // Compile a pattern for repeated use
-//! var pattern = try glob.compile(allocator, "src/**/*.zig", .{});
-//! defer pattern.deinit();
+//!     // Match a pattern against a path
+//!     const matches = try glob.match(allocator, "**/*.zig", "src/main.zig", .{});
+//!     _ = matches;
 //!
-//! // Walk filesystem matching pattern
-//! var iter = try glob.glob(allocator, &.{"**/*.zig"}, .{ .cwd = "." });
-//! defer iter.deinit();
-//! while (try iter.next()) |entry| {
-//!     std.debug.print("{s}\n", .{entry.path});
+//!     // Compile a pattern for repeated use
+//!     var pattern = try glob.compile(allocator, "src/**/*.zig", .{});
+//!     defer pattern.deinit();
+//!
+//!     // Walk filesystem matching pattern
+//!     var iter = try glob.glob(allocator, &.{"**/*.zig"}, .{ .cwd = "." });
+//!     defer iter.deinit();
+//!     while (try iter.next()) |entry| {
+//!         defer allocator.free(entry.path);
+//!         std.debug.print("{s}\n", .{entry.path});
+//!     }
 //! }
 //! ```
 
@@ -36,6 +45,7 @@ pub const ast = @import("compiler/ast.zig");
 pub const lexer = @import("compiler/lexer.zig");
 pub const brace = @import("compiler/brace.zig");
 pub const parser = @import("compiler/parser.zig");
+pub const validation = @import("compiler/validation.zig");
 
 // Re-export matcher modules
 pub const automaton = @import("matcher/automaton.zig");
@@ -73,6 +83,14 @@ pub const WalkerMatch = traverser.Match;
 
 pub const SymlinkPolicy = symlink.SymlinkPolicy;
 pub const VisitedSet = symlink.VisitedSet;
+
+// Validation types
+pub const ValidationError = validation.ValidationError;
+pub const ValidationResult = validation.ValidationResult;
+pub const validatePattern = validation.validatePattern;
+
+// Error handling policy for walker
+pub const ErrorPolicy = traverser.ErrorPolicy;
 
 /// Options for glob operations.
 pub const GlobOptions = struct {
