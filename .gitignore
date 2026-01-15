@@ -1,5 +1,6 @@
 *.md
 !README.md
+!docs/**
 # Created by https://gitignore.kjanat.com/api/zig,node,linux,macos,windows
 # Edit at https://gitignore.kjanat.com?templates=zig,node,linux,macos,windows
 

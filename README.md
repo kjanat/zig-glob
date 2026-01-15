@@ -9,22 +9,19 @@ A production-grade glob pattern matching library for Zig.
 - **POSIX character classes**: `[:alpha:]`, `[:digit:]`, `[:alnum:]`, etc.
 - **Brace expansion**: `{a,b,c}`, `{1..10}`, `{a..z}`
 - **Filesystem traversal**: Iterator-based with configurable symlink handling
-- **Cross-platform**: Works on Linux, macOS, and Windows
+- **Cross-platform**: Works on Linux, macOS, Windows, and FreeBSD
 - **DoS protection**: Limits on pattern complexity, brace expansion, and traversal depth
 - **Zero allocations** in hot paths (memoized matching)
 
 ## Installation
 
-Add to your `build.zig.zon`:
+Add the dependency using `zig fetch`:
 
-```zig
-.dependencies = .{
-    .zig_glob = .{
-        .url = "https://github.com/kjanat/zig-glob/archive/refs/heads/master.tar.gz",
-        // .hash = "...",
-    },
-},
+```bash
+zig fetch --save https://github.com/kjanat/zig-glob/archive/refs/tags/v0.1.0.tar.gz
 ```
+
+This adds zig-glob to your `build.zig.zon` with the correct hash.
 
 Then in `build.zig`:
 
@@ -65,14 +62,38 @@ pub fn main() !void {
 ## CLI Usage
 
 ```bash
-# Build the CLI tool
 zig build
+./zig-out/bin/zig-glob [OPTIONS] <PATTERN>... [--] [PATH...]
+```
 
+| Option                | Description                                 |
+| --------------------- | ------------------------------------------- |
+| `-d`, `--dot`         | Match dotfiles with wildcards               |
+| `-i`, `--ignore-case` | Case-insensitive matching                   |
+| `-L`, `--follow`      | Follow directory symlinks                   |
+| `-a`, `--absolute`    | Output absolute paths                       |
+| `-D`, `--mark-dirs`   | Append `/` to directory matches             |
+| `-x`, `--exclude`     | Exclude pattern (repeatable)                |
+| `--max-depth N`       | Maximum directory depth                     |
+| `-t`, `--type TYPE`   | Filter: `f`=files, `d`=directories, `a`=all |
+| `-0`, `--null`        | Null-terminated output (for `xargs -0`)     |
+| `-c`, `--count`       | Print match count only                      |
+| `-q`, `--quiet`       | Exit 0 if matches, 1 otherwise              |
+
+Examples:
+
+```bash
 # Find all Zig files
-./zig-out/bin/zig-glob '**/*.zig'
+zig-glob '**/*.zig'
 
-# Find files in specific directory
-./zig-out/bin/zig-glob '*.md' docs/
+# Find files excluding build cache
+zig-glob '**/*.zig' -x '**/zig-cache/**'
+
+# Find only files (not directories)
+zig-glob -t f '**/*'
+
+# Delete all log files
+zig-glob -0 '**/*.log' | xargs -0 rm
 ```
 
 ## API Reference
@@ -122,10 +143,29 @@ const options = glob.GlobOptions{
     .brace_expansion = true,         // Enable {a,b} expansion
     .extglob = true,                 // Enable ?(), *(), etc.
     .nocase = false,                 // Case-insensitive matching
-    .follow_dir_symlinks = false,    // Follow symlinks during traversal
+    .follow_symlinks = false,        // Follow directory symlinks
+    .include_broken_symlinks = true, // Include broken symlinks in results
     .max_depth = null,               // Recursion limit (null = unlimited)
     .types = .all,                   // .all, .files_only, .directories_only
+    .absolute = false,               // Return absolute paths
+    .mark_directories = false,       // Append / to directory matches
+    .exclude = null,                 // Patterns to exclude
 };
+```
+
+### Exclude Patterns
+
+Filter out unwanted matches:
+
+```zig
+var iter = try glob.glob(allocator, &.{"**/*.zig"}, .{
+    .exclude = &.{"**/zig-cache/**", "**/.zig-cache/**"},
+});
+defer iter.deinit();
+while (try iter.next()) |entry| {
+    defer allocator.free(entry.path);
+    // Only .zig files outside cache directories
+}
 ```
 
 ## Pattern Syntax
@@ -158,7 +198,7 @@ Built-in DoS protection:
 | --------------- | --------- | ------------------------------- |
 | Pattern length  | 64KB      | Prevent memory exhaustion       |
 | Brace nesting   | 10 levels | Prevent stack overflow          |
-| Brace expansion | 10,000    | Prevent combinatorial explosion |
+| Brace expansion | 1,024     | Prevent combinatorial explosion |
 | Range span      | 1,000     | Prevent `{0..999999}`           |
 | Traversal depth | 100       | Prevent infinite recursion      |
 | Path segments   | 256       | Prevent excessive nesting       |
