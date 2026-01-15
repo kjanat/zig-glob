@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
 const validation = @import("validation.zig");
 
 /// Error type for brace expansion.

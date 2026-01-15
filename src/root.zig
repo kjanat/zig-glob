@@ -40,21 +40,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-// Re-export compiler modules
 pub const ast = @import("compiler/ast.zig");
-pub const lexer = @import("compiler/lexer.zig");
-pub const brace = @import("compiler/brace.zig");
-pub const parser = @import("compiler/parser.zig");
-pub const validation = @import("compiler/validation.zig");
-
-// Re-export matcher modules
-pub const automaton = @import("matcher/automaton.zig");
-
-// Re-export walker modules
-pub const traverser = @import("walker/traverser.zig");
-pub const symlink = @import("walker/symlink.zig");
-
-// Re-export types
 pub const Node = ast.Node;
 pub const Pattern = ast.Pattern;
 pub const CompileOptions = ast.CompileOptions;
@@ -63,35 +49,38 @@ pub const CharMember = ast.CharMember;
 pub const PosixClass = ast.PosixClass;
 pub const ExtGlob = ast.ExtGlob;
 pub const ExtGlobOp = ast.ExtGlobOp;
-
+pub const brace = @import("compiler/brace.zig");
+pub const BraceError = brace.BraceError;
+pub const BraceOptions = brace.BraceOptions;
+pub const lexer = @import("compiler/lexer.zig");
 pub const Token = lexer.Token;
 pub const TokenKind = lexer.TokenKind;
 pub const Lexer = lexer.Lexer;
-
-pub const BraceError = brace.BraceError;
-pub const BraceOptions = brace.BraceOptions;
-
+pub const parser = @import("compiler/parser.zig");
 pub const ParseError = parser.ParseError;
 pub const Parser = parser.Parser;
-
-pub const Matcher = automaton.Matcher;
-pub const MatchOptions = automaton.MatchOptions;
-
-pub const Walker = traverser.Walker;
-pub const WalkerOptions = traverser.WalkerOptions;
-pub const WalkerMatch = traverser.Match;
-
-pub const SymlinkPolicy = symlink.SymlinkPolicy;
-pub const VisitedSet = symlink.VisitedSet;
-
-// Validation types
+pub const validation = @import("compiler/validation.zig");
 pub const ValidationError = validation.ValidationError;
 pub const ValidationResult = validation.ValidationResult;
 pub const validatePattern = validation.validatePattern;
-
-// Error handling policy for walker
+pub const automaton = @import("matcher/automaton.zig");
+pub const Matcher = automaton.Matcher;
+pub const MatchOptions = automaton.MatchOptions;
+pub const symlink = @import("walker/symlink.zig");
+pub const SymlinkPolicy = symlink.SymlinkPolicy;
+pub const VisitedSet = symlink.VisitedSet;
+pub const traverser = @import("walker/traverser.zig");
+pub const Walker = traverser.Walker;
+pub const WalkerOptions = traverser.WalkerOptions;
+pub const WalkerMatch = traverser.Match;
 pub const ErrorPolicy = traverser.ErrorPolicy;
 
+// Re-export compiler modules
+// Re-export matcher modules
+// Re-export walker modules
+// Re-export types
+// Validation types
+// Error handling policy for walker
 /// Options for glob operations.
 pub const GlobOptions = struct {
     /// Base directory for relative patterns.

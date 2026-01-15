@@ -1,7 +1,8 @@
 const std = @import("std");
 const zig_glob = @import("zig_glob");
+const build_options = @import("build_options");
 
-const version = "0.1.0";
+const version = build_options.version;
 
 const usage =
     \\Usage: zig-glob [OPTIONS] <PATTERN>... [--] [PATH...]

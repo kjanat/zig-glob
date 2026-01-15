@@ -1,12 +1,20 @@
+//! Filesystem traversal with glob pattern matching.
+//!
+//! Walks directory trees matching files against compiled glob patterns.
+//! Supports globstar (`**`), symlink following with cycle detection,
+//! depth limits, and exclude patterns.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const testing = std.testing;
+
 const ast = @import("../compiler/ast.zig");
 const Pattern = ast.Pattern;
 const Node = ast.Node;
+const parser = @import("../compiler/parser.zig");
 const automaton = @import("../matcher/automaton.zig");
 const Matcher = automaton.Matcher;
 const MatchOptions = automaton.MatchOptions;
-const parser = @import("../compiler/parser.zig");
 
 /// Result of a successful match during filesystem traversal.
 pub const Match = struct {
@@ -803,8 +811,6 @@ pub const Walker = struct {
 // ============================================================================
 // Tests
 // ============================================================================
-
-const testing = std.testing;
 
 fn createTestDir(allocator: Allocator) !struct { path: []const u8, dir: std.fs.Dir } {
     // Create a unique temp directory

@@ -9,9 +9,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ast = @import("ast.zig");
-const lexer = @import("lexer.zig");
 
+const ast = @import("ast.zig");
 const Node = ast.Node;
 const CharClass = ast.CharClass;
 const CharMember = ast.CharMember;
@@ -20,7 +19,7 @@ const ExtGlobOp = ast.ExtGlobOp;
 const PosixClass = ast.PosixClass;
 const Pattern = ast.Pattern;
 const CompileOptions = ast.CompileOptions;
-
+const lexer = @import("lexer.zig");
 const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 const Lexer = lexer.Lexer;

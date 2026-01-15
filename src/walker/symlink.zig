@@ -6,9 +6,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
+const builtin = @import("builtin");
 
 /// Mode for stat operations - determines whether symlinks are followed.
 pub const StatMode = enum {

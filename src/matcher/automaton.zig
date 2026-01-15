@@ -6,13 +6,15 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ast = @import("../compiler/ast.zig");
+const testing = std.testing;
 
+const ast = @import("../compiler/ast.zig");
 const Node = ast.Node;
 const CharClass = ast.CharClass;
 const ExtGlob = ast.ExtGlob;
 const ExtGlobOp = ast.ExtGlobOp;
 const Pattern = ast.Pattern;
+const parser = @import("../compiler/parser.zig");
 
 /// Path separators for cross-platform path splitting.
 /// Accept both forward and back slashes regardless of platform.
@@ -892,9 +894,6 @@ pub fn matchSegment(allocator: Allocator, pattern_node: Node, name: []const u8, 
 }
 
 // Tests
-
-const testing = std.testing;
-const parser = @import("../compiler/parser.zig");
 
 fn testMatch(pattern_str: []const u8, input: []const u8, expected: bool) !void {
     const allocator = testing.allocator;
