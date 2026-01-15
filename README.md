@@ -171,4 +171,10 @@ zig build test
 
 ## License
 
-MIT
+[MIT]
+
+<!--link-definitions-start-->
+
+[MIT]: https://github.com/kjanat/zig-glob/blob/master/LICENSE
+
+<!--link-definitions-end-->
