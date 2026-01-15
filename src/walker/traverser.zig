@@ -27,14 +27,16 @@ pub const WalkerOptions = struct {
     nocase: bool = false,
     /// Follow directory symlinks (enables cycle detection).
     follow_symlinks: bool = false,
+    /// Include broken symlinks in results.
+    include_broken_symlinks: bool = true,
     /// Maximum traversal depth (null = unlimited).
     max_depth: ?u32 = null,
 };
 
 /// Inode key for cycle detection when following symlinks.
+/// Note: Using inode alone assumes same-filesystem traversal (typical case).
 const InodeKey = struct {
-    dev: u64,
-    ino: u64,
+    ino: std.fs.File.INode,
 };
 
 /// Work queue item representing a directory to process.
@@ -77,7 +79,7 @@ pub const Walker = struct {
     options: WalkerOptions,
 
     /// Work queue for directories to process.
-    work_queue: std.ArrayList(WorkItem),
+    work_queue: std.array_list.AlignedManaged(WorkItem, null),
 
     /// Current iteration state (if iterating a directory).
     current_iter: ?IterState,
@@ -86,7 +88,7 @@ pub const Walker = struct {
     visited: std.AutoHashMap(InodeKey, void),
 
     /// Pending matches to return (for cases where we find matches during queue processing).
-    pending_matches: std.ArrayList(Match),
+    pending_matches: std.array_list.AlignedManaged(Match, null),
 
     /// The root directory handle.
     root_dir: std.fs.Dir,
@@ -105,10 +107,10 @@ pub const Walker = struct {
             .allocator = allocator,
             .pattern = pattern,
             .options = options,
-            .work_queue = std.ArrayList(WorkItem).init(allocator),
+            .work_queue = std.array_list.AlignedManaged(WorkItem, null).init(allocator),
             .current_iter = null,
             .visited = std.AutoHashMap(InodeKey, void).init(allocator),
-            .pending_matches = std.ArrayList(Match).init(allocator),
+            .pending_matches = std.array_list.AlignedManaged(Match, null).init(allocator),
             .root_dir = root_dir,
             .owns_root = false,
         };
@@ -193,7 +195,7 @@ pub const Walker = struct {
                 return null; // Done
             }
 
-            var work_item = self.work_queue.pop();
+            var work_item = self.work_queue.pop() orelse return null;
 
             // Check depth limit
             if (self.options.max_depth) |max| {
@@ -300,7 +302,7 @@ pub const Walker = struct {
             };
         } else {
             // Not last segment: try to open as directory
-            const sub_dir = work_item.dir.openDir(literal, .{ .iterate = true }) catch {
+            var sub_dir = work_item.dir.openDir(literal, .{ .iterate = true }) catch {
                 // Can't descend
                 self.allocator.free(new_prefix);
                 work_item.deinit(self.allocator);
@@ -346,19 +348,23 @@ pub const Walker = struct {
     /// Set up iteration for a globstar segment.
     fn setupGlobstarIteration(self: *Walker, work_item: *WorkItem) !void {
         // First, push a work item that skips the globstar (matches zero directories)
+        // This skip work item will own the dir if the original owned it.
         const skip_prefix = try self.allocator.dupe(u8, work_item.prefix);
         try self.work_queue.append(.{
             .dir = work_item.dir,
             .prefix = skip_prefix,
             .segment_idx = work_item.segment_idx + 1,
             .depth = work_item.depth,
-            .owns_dir = false,
+            .owns_dir = work_item.owns_dir, // Transfer ownership to skip item
         });
 
-        // Then set up iteration for matching one or more directories
+        // Then set up iteration for matching one or more directories.
+        // Current iteration doesn't own the dir (ownership transferred to skip item).
+        var iter_work_item = work_item.*;
+        iter_work_item.owns_dir = false; // Don't close dir when iteration ends
         self.current_iter = .{
             .iter = work_item.dir.iterate(),
-            .work_item = work_item.*,
+            .work_item = iter_work_item,
             .globstar_mode = true,
             .globstar_skip_pushed = true,
         };
@@ -403,7 +409,7 @@ pub const Walker = struct {
         errdefer self.allocator.free(new_prefix);
 
         // Open the subdirectory
-        const sub_dir = state.work_item.dir.openDir(entry.name, .{ .iterate = true }) catch {
+        var sub_dir = state.work_item.dir.openDir(entry.name, .{ .iterate = true }) catch {
             self.allocator.free(new_prefix);
             return;
         };
@@ -493,7 +499,7 @@ pub const Walker = struct {
             };
         } else if (entry.kind == .directory) {
             // More segments: descend
-            const sub_dir = state.work_item.dir.openDir(entry.name, .{ .iterate = true }) catch {
+            var sub_dir = state.work_item.dir.openDir(entry.name, .{ .iterate = true }) catch {
                 self.allocator.free(new_prefix);
                 return null;
             };
@@ -578,10 +584,7 @@ pub const Walker = struct {
     /// Check if visiting a directory would create a cycle.
     fn checkCycle(self: *Walker, dir: std.fs.Dir) !bool {
         const stat = dir.stat() catch return false;
-        const key = InodeKey{
-            .dev = stat.dev,
-            .ino = stat.ino,
-        };
+        const key = InodeKey{ .ino = stat.inode };
 
         if (self.visited.contains(key)) {
             return true;
@@ -600,7 +603,7 @@ pub const Walker = struct {
 
     /// Collect all remaining matches into a slice.
     pub fn collectAll(self: *Walker) ![]Match {
-        var results = std.ArrayList(Match).init(self.allocator);
+        var results = std.array_list.AlignedManaged(Match, null).init(self.allocator);
         errdefer {
             for (results.items) |*m| {
                 m.deinit(self.allocator);
@@ -656,7 +659,7 @@ test "walker: literal path matching" {
     const allocator = testing.allocator;
 
     // Create test directory structure
-    const test_info = try createTestDir(allocator);
+    var test_info = try createTestDir(allocator);
     defer cleanupTestDir(allocator, test_info.path);
     defer test_info.dir.close();
 
@@ -699,7 +702,7 @@ test "walker: star pattern matching" {
     const allocator = testing.allocator;
 
     // Create test directory structure
-    const test_info = try createTestDir(allocator);
+    var test_info = try createTestDir(allocator);
     defer cleanupTestDir(allocator, test_info.path);
     defer test_info.dir.close();
 
@@ -750,7 +753,7 @@ test "walker: subdirectory traversal" {
     const allocator = testing.allocator;
 
     // Create test directory structure
-    const test_info = try createTestDir(allocator);
+    var test_info = try createTestDir(allocator);
     defer cleanupTestDir(allocator, test_info.path);
     defer test_info.dir.close();
 
@@ -788,7 +791,7 @@ test "walker: globstar basic" {
     const allocator = testing.allocator;
 
     // Create test directory structure
-    const test_info = try createTestDir(allocator);
+    var test_info = try createTestDir(allocator);
     defer cleanupTestDir(allocator, test_info.path);
     defer test_info.dir.close();
 
@@ -819,34 +822,40 @@ test "walker: globstar basic" {
     var walker = try Walker.init(allocator, &pattern, test_info.dir, .{});
     defer walker.deinit();
 
-    var found_paths = std.StringHashMap(void).init(allocator);
-    defer found_paths.deinit();
+    // Use ArrayList to track paths for simpler cleanup
+    var paths = std.array_list.AlignedManaged([]const u8, null).init(allocator);
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit();
+    }
 
     while (try walker.next()) |match| {
         const path_copy = try allocator.dupe(u8, match.path);
-        try found_paths.put(path_copy, {});
+        errdefer allocator.free(path_copy);
+        try paths.append(path_copy);
         var m = match;
         m.deinit(allocator);
     }
 
-    // Clean up path copies
-    defer {
-        var key_iter = found_paths.keyIterator();
-        while (key_iter.next()) |key| {
-            allocator.free(key.*);
-        }
+    // Check we found expected paths
+    var found_a = false;
+    var found_b = false;
+    var found_c = false;
+    for (paths.items) |p| {
+        if (std.mem.eql(u8, p, "a.zig")) found_a = true;
+        if (std.mem.eql(u8, p, "src/b.zig")) found_b = true;
+        if (std.mem.eql(u8, p, "src/sub/c.zig")) found_c = true;
     }
-
-    try testing.expect(found_paths.contains("a.zig"));
-    try testing.expect(found_paths.contains("src/b.zig"));
-    try testing.expect(found_paths.contains("src/sub/c.zig"));
+    try testing.expect(found_a);
+    try testing.expect(found_b);
+    try testing.expect(found_c);
 }
 
 test "walker: dotfile handling" {
     const allocator = testing.allocator;
 
     // Create test directory structure
-    const test_info = try createTestDir(allocator);
+    var test_info = try createTestDir(allocator);
     defer cleanupTestDir(allocator, test_info.path);
     defer test_info.dir.close();
 
@@ -904,7 +913,7 @@ test "walker: collectAll" {
     const allocator = testing.allocator;
 
     // Create test directory structure
-    const test_info = try createTestDir(allocator);
+    var test_info = try createTestDir(allocator);
     defer cleanupTestDir(allocator, test_info.path);
     defer test_info.dir.close();
 
