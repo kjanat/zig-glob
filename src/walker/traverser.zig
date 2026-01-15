@@ -6,6 +6,7 @@ const Node = ast.Node;
 const automaton = @import("../matcher/automaton.zig");
 const Matcher = automaton.Matcher;
 const MatchOptions = automaton.MatchOptions;
+const parser = @import("../compiler/parser.zig");
 
 /// Result of a successful match during filesystem traversal.
 pub const Match = struct {
@@ -46,6 +47,8 @@ pub const WalkerOptions = struct {
     /// Callback for reported errors (used when error_policy is skip_report).
     /// Path is the path that caused the error.
     error_callback: ?*const fn (path: []const u8, err: anyerror) void = null,
+    /// Patterns to exclude from results (compiled at init time for performance).
+    exclude: ?[]const []const u8 = null,
 };
 
 /// Inode key for cycle detection when following symlinks.
@@ -111,6 +114,12 @@ pub const Walker = struct {
     /// Whether walker owns the root directory.
     owns_root: bool,
 
+    /// Compiled exclude patterns (owned by walker).
+    exclude_patterns: std.array_list.AlignedManaged(Pattern, null),
+
+    /// Pre-compiled matchers for exclude patterns (avoids alloc per check).
+    exclude_matchers: std.array_list.AlignedManaged(Matcher, null),
+
     /// Initialize walker for a pattern starting from a directory.
     pub fn init(
         allocator: Allocator,
@@ -118,6 +127,45 @@ pub const Walker = struct {
         root_dir: std.fs.Dir,
         options: WalkerOptions,
     ) !Walker {
+        // Compile exclude patterns upfront for performance
+        var exclude_patterns = std.array_list.AlignedManaged(Pattern, null).init(allocator);
+        errdefer {
+            for (exclude_patterns.items) |*p| p.deinit();
+            exclude_patterns.deinit();
+        }
+
+        if (options.exclude) |excludes| {
+            try exclude_patterns.ensureTotalCapacity(excludes.len);
+            for (excludes) |exclude_str| {
+                const compiled = try parser.parse(allocator, exclude_str, .{
+                    .globstar = true,
+                    .brace = false, // Exclude patterns should be pre-expanded
+                    .extglob = true,
+                    .nocase = options.nocase,
+                    .dot = true, // Exclude should match dotfiles
+                });
+                exclude_patterns.appendAssumeCapacity(compiled);
+            }
+        }
+
+        // Pre-compile matchers for exclude patterns (avoids alloc per isExcluded check)
+        var exclude_matchers = std.array_list.AlignedManaged(Matcher, null).init(allocator);
+        errdefer {
+            for (exclude_matchers.items) |*m| m.deinit();
+            exclude_matchers.deinit();
+        }
+
+        if (exclude_patterns.items.len > 0) {
+            try exclude_matchers.ensureTotalCapacity(exclude_patterns.items.len);
+            for (exclude_patterns.items) |*excl_pattern| {
+                const matcher = Matcher.init(allocator, excl_pattern, .{
+                    .dot = true,
+                    .nocase = options.nocase,
+                });
+                exclude_matchers.appendAssumeCapacity(matcher);
+            }
+        }
+
         var walker = Walker{
             .allocator = allocator,
             .pattern = pattern,
@@ -128,6 +176,8 @@ pub const Walker = struct {
             .pending_matches = std.array_list.AlignedManaged(Match, null).init(allocator),
             .root_dir = root_dir,
             .owns_root = false,
+            .exclude_patterns = exclude_patterns,
+            .exclude_matchers = exclude_matchers,
         };
 
         // Add initial work item at root
@@ -177,6 +227,18 @@ pub const Walker = struct {
         }
         self.pending_matches.deinit();
 
+        // Clean up exclude matchers (must be before patterns since matchers reference patterns)
+        for (self.exclude_matchers.items) |*m| {
+            m.deinit();
+        }
+        self.exclude_matchers.deinit();
+
+        // Clean up exclude patterns
+        for (self.exclude_patterns.items) |*p| {
+            p.deinit();
+        }
+        self.exclude_patterns.deinit();
+
         // Clean up visited set
         self.visited.deinit();
 
@@ -186,17 +248,38 @@ pub const Walker = struct {
         }
     }
 
+    /// Check if a path matches any exclude pattern.
+    /// Uses pre-compiled matchers for performance (no allocations per check).
+    fn isExcluded(self: *Walker, path: []const u8) bool {
+        for (self.exclude_matchers.items) |*matcher| {
+            if (matcher.matchPath(path) catch false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Get the next match, or null if iteration is complete.
     pub fn next(self: *Walker) !?Match {
         while (true) {
             // First, return any pending matches
-            if (self.pending_matches.items.len > 0) {
-                return self.pending_matches.pop();
+            if (self.pending_matches.pop()) |match| {
+                // Check exclude patterns
+                if (self.isExcluded(match.path)) {
+                    self.allocator.free(match.path);
+                    continue;
+                }
+                return match;
             }
 
             // If we have a current directory iteration, continue it
             if (self.current_iter) |*state| {
                 if (try self.processIterEntry(state)) |match| {
+                    // Check exclude patterns
+                    if (self.isExcluded(match.path)) {
+                        self.allocator.free(match.path);
+                        continue;
+                    }
                     return match;
                 }
                 // Iterator exhausted, clean up
@@ -222,6 +305,11 @@ pub const Walker = struct {
 
             // Process the work item
             if (try self.processWorkItem(&work_item)) |match| {
+                // Check exclude patterns
+                if (self.isExcluded(match.path)) {
+                    self.allocator.free(match.path);
+                    continue;
+                }
                 return match;
             }
         }
@@ -1561,4 +1649,484 @@ test "edge: hidden directory traversal with globstar" {
         try testing.expect(found_visible);
         try testing.expect(found_hidden);
     }
+}
+
+// ============================================================================
+// Walker Exclude Functionality Tests
+// ============================================================================
+
+test "walker exclude: basic exclude pattern" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create test files
+    try createTestFile(test_info.dir, "keep.txt");
+    try createTestFile(test_info.dir, "exclude.txt");
+
+    // Create * pattern with exclude
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = &.{"**/exclude.txt"},
+    });
+    defer walker.deinit();
+
+    var found_keep = false;
+    var found_exclude = false;
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, "keep.txt")) found_keep = true;
+        if (std.mem.eql(u8, match.path, "exclude.txt")) found_exclude = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(found_keep);
+    try testing.expect(!found_exclude);
+}
+
+test "walker exclude: multiple exclude patterns" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create test files
+    try createTestFile(test_info.dir, "file1.txt");
+    try createTestFile(test_info.dir, "file2.txt");
+    try createTestFile(test_info.dir, "file3.txt");
+    try createTestFile(test_info.dir, "keep.md");
+
+    // Create * pattern with multiple excludes
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = &.{ "**/file1.txt", "**/file2.txt" },
+    });
+    defer walker.deinit();
+
+    var found_file1 = false;
+    var found_file2 = false;
+    var found_file3 = false;
+    var found_keep = false;
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, "file1.txt")) found_file1 = true;
+        if (std.mem.eql(u8, match.path, "file2.txt")) found_file2 = true;
+        if (std.mem.eql(u8, match.path, "file3.txt")) found_file3 = true;
+        if (std.mem.eql(u8, match.path, "keep.md")) found_keep = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(!found_file1);
+    try testing.expect(!found_file2);
+    try testing.expect(found_file3);
+    try testing.expect(found_keep);
+}
+
+test "walker exclude: globstar exclude pattern" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create nested structure
+    try createTestFile(test_info.dir, "src/main.zig");
+    try createTestFile(test_info.dir, "src/lib/utils.zig");
+    try createTestFile(test_info.dir, "tests/test.zig");
+
+    // Create ** pattern with exclude for tests directory
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .globstar;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "**",
+    };
+
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = &.{"**/tests/**"},
+    });
+    defer walker.deinit();
+
+    var found_src = false;
+    var found_tests = false;
+    while (try walker.next()) |match| {
+        if (std.mem.indexOf(u8, match.path, "src/") != null) found_src = true;
+        if (std.mem.indexOf(u8, match.path, "tests/") != null) found_tests = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(found_src);
+    try testing.expect(!found_tests);
+}
+
+test "walker exclude: exclude with nocase option" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create test files with mixed case
+    try createTestFile(test_info.dir, "test.txt");
+    try createTestFile(test_info.dir, "keep.txt");
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // Exclude with uppercase pattern, nocase should match lowercase
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .nocase = true,
+        .exclude = &.{"**/TEST.txt"},
+    });
+    defer walker.deinit();
+
+    var found_test = false;
+    var found_keep = false;
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, "test.txt")) found_test = true;
+        if (std.mem.eql(u8, match.path, "keep.txt")) found_keep = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(!found_test); // Should be excluded (nocase)
+    try testing.expect(found_keep);
+}
+
+test "walker exclude: exclude matches dotfiles" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create dotfiles
+    try createTestFile(test_info.dir, ".hidden");
+    try createTestFile(test_info.dir, "visible.txt");
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // Enable dot matching, but exclude dotfiles
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .dot = true,
+        .exclude = &.{"**/.*"}, // Exclude all dotfiles
+    });
+    defer walker.deinit();
+
+    var found_hidden = false;
+    var found_visible = false;
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, ".hidden")) found_hidden = true;
+        if (std.mem.eql(u8, match.path, "visible.txt")) found_visible = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(!found_hidden); // Should be excluded
+    try testing.expect(found_visible);
+}
+
+test "walker exclude: empty exclude list" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    try createTestFile(test_info.dir, "file.txt");
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // Empty exclude slice
+    const empty_excludes: []const []const u8 = &.{};
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = empty_excludes,
+    });
+    defer walker.deinit();
+
+    var count: u32 = 0;
+    while (try walker.next()) |match| {
+        count += 1;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(count >= 1);
+}
+
+test "walker exclude: null exclude option" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    try createTestFile(test_info.dir, "file.txt");
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // null exclude
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = null,
+    });
+    defer walker.deinit();
+
+    var count: u32 = 0;
+    while (try walker.next()) |match| {
+        count += 1;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(count >= 1);
+}
+
+test "walker exclude: exclude all with globstar" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    try createTestFile(test_info.dir, "file1.txt");
+    try createTestFile(test_info.dir, "file2.txt");
+    try createTestFile(test_info.dir, "sub/file3.txt");
+
+    // Create ** pattern
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .globstar;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "**",
+    };
+
+    // Exclude everything using ** pattern (matches any path)
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = &.{"**"},
+    });
+    defer walker.deinit();
+
+    var count: u32 = 0;
+    while (try walker.next()) |match| {
+        count += 1;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    // Should find nothing (all excluded by ** pattern)
+    try testing.expectEqual(@as(u32, 0), count);
+}
+
+test "walker exclude: exclude with character class" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create files with different first letters
+    try createTestFile(test_info.dir, "alpha.txt");
+    try createTestFile(test_info.dir, "beta.txt");
+    try createTestFile(test_info.dir, "gamma.txt");
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // Exclude files starting with a or b
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = &.{"**/[ab]*.txt"},
+    });
+    defer walker.deinit();
+
+    var found_alpha = false;
+    var found_beta = false;
+    var found_gamma = false;
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, "alpha.txt")) found_alpha = true;
+        if (std.mem.eql(u8, match.path, "beta.txt")) found_beta = true;
+        if (std.mem.eql(u8, match.path, "gamma.txt")) found_gamma = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(!found_alpha);
+    try testing.expect(!found_beta);
+    try testing.expect(found_gamma);
+}
+
+test "walker exclude: exclude with question mark wildcard" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create files with different name lengths
+    try createTestFile(test_info.dir, "ab.txt");
+    try createTestFile(test_info.dir, "abc.txt");
+    try createTestFile(test_info.dir, "abcd.txt");
+
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .star;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "*",
+    };
+
+    // Exclude 3-char filenames
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = &.{"**/???.txt"},
+    });
+    defer walker.deinit();
+
+    var found_ab = false;
+    var found_abc = false;
+    var found_abcd = false;
+    while (try walker.next()) |match| {
+        if (std.mem.eql(u8, match.path, "ab.txt")) found_ab = true;
+        if (std.mem.eql(u8, match.path, "abc.txt")) found_abc = true;
+        if (std.mem.eql(u8, match.path, "abcd.txt")) found_abcd = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(found_ab);
+    try testing.expect(!found_abc); // 3 chars, should be excluded
+    try testing.expect(found_abcd);
+}
+
+test "walker exclude: exclude in nested directory" {
+    const allocator = testing.allocator;
+
+    var test_info = try createTestDir(allocator);
+    defer cleanupTestDir(allocator, test_info.path);
+    defer test_info.dir.close();
+
+    // Create nested structure
+    try createTestFile(test_info.dir, "a/b/c/deep.txt");
+    try createTestFile(test_info.dir, "a/shallow.txt");
+    try createTestFile(test_info.dir, "root.txt");
+
+    // Create ** pattern
+    const segments = try allocator.alloc(Node, 1);
+    defer allocator.free(segments);
+    segments[0] = .globstar;
+
+    var pattern = Pattern{
+        .allocator = allocator,
+        .segments = segments,
+        .is_absolute = false,
+        .trailing_slash = false,
+        .original = "**",
+    };
+
+    // Exclude deep files
+    var walker = try Walker.init(allocator, &pattern, test_info.dir, .{
+        .exclude = &.{"**/a/b/**"},
+    });
+    defer walker.deinit();
+
+    var found_deep = false;
+    var found_shallow = false;
+    var found_root = false;
+    while (try walker.next()) |match| {
+        if (std.mem.indexOf(u8, match.path, "deep.txt") != null) found_deep = true;
+        if (std.mem.indexOf(u8, match.path, "shallow.txt") != null) found_shallow = true;
+        if (std.mem.eql(u8, match.path, "root.txt")) found_root = true;
+        var m = match;
+        m.deinit(allocator);
+    }
+
+    try testing.expect(!found_deep); // Should be excluded
+    try testing.expect(found_shallow);
+    try testing.expect(found_root);
 }

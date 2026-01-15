@@ -269,9 +269,11 @@ pub const GlobIterator = struct {
                 // Now initialize walker with pointer to stored pattern
                 wp.walker = try traverser.Walker.initFromPath(allocator, &wp.pattern, options.cwd, .{
                     .dot = options.dot,
+                    .nocase = options.nocase,
                     .follow_symlinks = options.follow_dir_symlinks,
                     .include_broken_symlinks = options.include_broken_symlinks,
                     .max_depth = options.max_depth,
+                    .exclude = options.exclude,
                 });
             }
         }
@@ -453,6 +455,687 @@ test "glob with type filter" {
     }
 
     try std.testing.expect(found_compiler);
+}
+
+test "glob with exclude pattern" {
+    const allocator = std.testing.allocator;
+
+    // Match all .zig files but exclude root.zig
+    var iter = try glob(allocator, &.{"src/*.zig"}, .{
+        .exclude = &.{"**/root.zig"},
+    });
+    defer iter.deinit();
+
+    var found_main = false;
+    var found_root = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "main.zig")) {
+            found_main = true;
+        }
+        if (std.mem.endsWith(u8, entry.path, "root.zig")) {
+            found_root = true;
+        }
+    }
+
+    try std.testing.expect(found_main); // main.zig should be found
+    try std.testing.expect(!found_root); // root.zig should be excluded
+}
+
+test "glob with multiple exclude patterns" {
+    const allocator = std.testing.allocator;
+
+    // Match all files in compiler but exclude lexer and parser
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{ "**/lexer.zig", "**/parser.zig" },
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    var found_lexer = false;
+    var found_parser = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) found_ast = true;
+        if (std.mem.endsWith(u8, entry.path, "lexer.zig")) found_lexer = true;
+        if (std.mem.endsWith(u8, entry.path, "parser.zig")) found_parser = true;
+    }
+
+    try std.testing.expect(found_ast); // ast.zig should be found
+    try std.testing.expect(!found_lexer); // lexer.zig should be excluded
+    try std.testing.expect(!found_parser); // parser.zig should be excluded
+}
+
+test "glob exclude with globstar" {
+    const allocator = std.testing.allocator;
+
+    // Match everything but exclude all .zig files
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .exclude = &.{"**/*.zig"},
+        .types = .files_only,
+    });
+    defer iter.deinit();
+
+    var found_zig = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, ".zig")) {
+            found_zig = true;
+        }
+    }
+
+    // Should not find any .zig files
+    try std.testing.expect(!found_zig);
+}
+
+// ============================================================================
+// Exclude Functionality Tests - Edge Cases
+// ============================================================================
+
+test "exclude: empty exclude list matches everything" {
+    const allocator = std.testing.allocator;
+
+    // Match all .zig files with empty exclude list (null = no exclusions)
+    var iter = try glob(allocator, &.{"src/*.zig"}, .{
+        .exclude = null, // Explicit null
+    });
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        count += 1;
+    }
+
+    // Should find files (at least root.zig)
+    try std.testing.expect(count >= 1);
+}
+
+test "exclude: empty slice exclude list matches everything" {
+    const allocator = std.testing.allocator;
+
+    // Match all .zig files with empty exclude slice
+    const empty_excludes: []const []const u8 = &.{};
+    var iter = try glob(allocator, &.{"src/*.zig"}, .{
+        .exclude = empty_excludes,
+    });
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        count += 1;
+    }
+
+    // Should find files (at least root.zig)
+    try std.testing.expect(count >= 1);
+}
+
+test "exclude: pattern that matches nothing" {
+    const allocator = std.testing.allocator;
+
+    // Exclude pattern that won't match any real files
+    var iter = try glob(allocator, &.{"src/*.zig"}, .{
+        .exclude = &.{"**/nonexistent_pattern_xyz123.abc"},
+    });
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        count += 1;
+    }
+
+    // Should find all .zig files since exclude matches nothing
+    try std.testing.expect(count >= 1);
+}
+
+test "exclude: pattern that matches everything" {
+    const allocator = std.testing.allocator;
+
+    // Exclude all files with **/*
+    var iter = try glob(allocator, &.{"src/**/*.zig"}, .{
+        .exclude = &.{"**/*"},
+        .types = .files_only,
+    });
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        count += 1;
+    }
+
+    // Should find nothing since all are excluded
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "exclude: pattern with special characters in filename" {
+    const allocator = std.testing.allocator;
+
+    // Test that exclude works with patterns containing special chars
+    // Using a pattern that might have special characters
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .exclude = &.{"**/*.zig"},
+    });
+    defer iter.deinit();
+
+    var found_zig = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, ".zig")) {
+            found_zig = true;
+        }
+    }
+
+    // Should not find any .zig files
+    try std.testing.expect(!found_zig);
+}
+
+// ============================================================================
+// Exclude Functionality Tests - Pattern Types
+// ============================================================================
+
+test "exclude: simple wildcard pattern (*.txt)" {
+    const allocator = std.testing.allocator;
+
+    // This tests that simple *.ext patterns work in exclude
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .exclude = &.{"**/*.zig"},
+        .types = .files_only,
+    });
+    defer iter.deinit();
+
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        // Verify no .zig files come through
+        try std.testing.expect(!std.mem.endsWith(u8, entry.path, ".zig"));
+    }
+}
+
+test "exclude: question mark wildcard" {
+    const allocator = std.testing.allocator;
+
+    // Exclude files with single character before .zig
+    // This tests ? wildcard in exclude patterns
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{"**/???.zig"}, // Excludes 3-char names like ast.zig
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    var found_lexer = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) found_ast = true;
+        if (std.mem.endsWith(u8, entry.path, "lexer.zig")) found_lexer = true;
+    }
+
+    // ast.zig (3 chars) should be excluded, lexer.zig (5 chars) should remain
+    try std.testing.expect(!found_ast);
+    try std.testing.expect(found_lexer);
+}
+
+test "exclude: character class pattern [a-z]" {
+    const allocator = std.testing.allocator;
+
+    // Exclude files starting with specific letters
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{"**/[ab]*.zig"}, // Excludes ast.zig, brace.zig
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    var found_brace = false;
+    var found_lexer = false;
+    var found_parser = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) found_ast = true;
+        if (std.mem.endsWith(u8, entry.path, "brace.zig")) found_brace = true;
+        if (std.mem.endsWith(u8, entry.path, "lexer.zig")) found_lexer = true;
+        if (std.mem.endsWith(u8, entry.path, "parser.zig")) found_parser = true;
+    }
+
+    // ast.zig and brace.zig should be excluded
+    try std.testing.expect(!found_ast);
+    try std.testing.expect(!found_brace);
+    // lexer.zig and parser.zig should remain
+    try std.testing.expect(found_lexer);
+    try std.testing.expect(found_parser);
+}
+
+test "exclude: negated character class [^a-z]" {
+    const allocator = std.testing.allocator;
+
+    // Exclude files NOT starting with a-l (should keep ast, brace, lexer but exclude parser, validation)
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{"**/[^a-l]*.zig"}, // Excludes files starting with m-z
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    var found_parser = false;
+    var found_validation = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) found_ast = true;
+        if (std.mem.endsWith(u8, entry.path, "parser.zig")) found_parser = true;
+        if (std.mem.endsWith(u8, entry.path, "validation.zig")) found_validation = true;
+    }
+
+    // ast.zig should remain (starts with 'a')
+    try std.testing.expect(found_ast);
+    // parser.zig and validation.zig should be excluded (start with p, v)
+    try std.testing.expect(!found_parser);
+    try std.testing.expect(!found_validation);
+}
+
+test "exclude: extglob optional pattern ?()" {
+    const allocator = std.testing.allocator;
+
+    // Test extglob optional in exclude
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{"**/ast?(s).zig"}, // Excludes ast.zig or asts.zig
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) found_ast = true;
+    }
+
+    // ast.zig should be excluded
+    try std.testing.expect(!found_ast);
+}
+
+test "exclude: extglob alternatives @(a|b)" {
+    const allocator = std.testing.allocator;
+
+    // Test extglob alternatives in exclude
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{"**/@(ast|lexer).zig"}, // Excludes ast.zig or lexer.zig
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    var found_lexer = false;
+    var found_parser = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) found_ast = true;
+        if (std.mem.endsWith(u8, entry.path, "lexer.zig")) found_lexer = true;
+        if (std.mem.endsWith(u8, entry.path, "parser.zig")) found_parser = true;
+    }
+
+    // ast.zig and lexer.zig should be excluded
+    try std.testing.expect(!found_ast);
+    try std.testing.expect(!found_lexer);
+    // parser.zig should remain
+    try std.testing.expect(found_parser);
+}
+
+test "exclude: extglob negation !(pattern)" {
+    const allocator = std.testing.allocator;
+
+    // Exclude everything EXCEPT .zig files (using negation)
+    // !(*.zig) means match anything that is NOT *.zig
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .exclude = &.{"**/!(*.zig)"},
+        .types = .files_only,
+    });
+    defer iter.deinit();
+
+    var found_zig = false;
+    var found_non_zig = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, ".zig")) {
+            found_zig = true;
+        } else {
+            found_non_zig = true;
+        }
+    }
+
+    // Should find .zig files (not excluded)
+    try std.testing.expect(found_zig);
+    // Non-.zig files would be excluded by the negation pattern
+}
+
+// ============================================================================
+// Exclude Functionality Tests - Option Interactions
+// ============================================================================
+
+test "exclude: interaction with dot option (dotfiles)" {
+    const allocator = std.testing.allocator;
+
+    // Test that exclude patterns can match dotfiles when dot=true
+    var iter = try glob(allocator, &.{"**/*"}, .{
+        .cwd = ".",
+        .dot = true, // Include dotfiles in main pattern
+        .exclude = &.{ "**/.git/**", "**/.*" }, // Exclude .git and dotfiles
+    });
+    defer iter.deinit();
+
+    var found_git = false;
+    var found_dotfile = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.indexOf(u8, entry.path, ".git") != null) {
+            found_git = true;
+        }
+        // Check for dotfiles (files starting with .)
+        const basename = std.fs.path.basename(entry.path);
+        if (basename.len > 0 and basename[0] == '.') {
+            found_dotfile = true;
+        }
+    }
+
+    // .git directory content should be excluded
+    try std.testing.expect(!found_git);
+}
+
+test "exclude: interaction with nocase option" {
+    const allocator = std.testing.allocator;
+
+    // Test case-insensitive exclude matching
+    var iter = try glob(allocator, &.{"src/**/*.zig"}, .{
+        .nocase = true,
+        .exclude = &.{"**/ROOT.zig"}, // Uppercase - should match root.zig with nocase
+    });
+    defer iter.deinit();
+
+    var found_root = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        // Check both case variants
+        if (std.mem.endsWith(u8, entry.path, "root.zig") or
+            std.mem.endsWith(u8, entry.path, "ROOT.zig"))
+        {
+            found_root = true;
+        }
+    }
+
+    // root.zig should be excluded due to nocase matching
+    try std.testing.expect(!found_root);
+}
+
+test "exclude: interaction with files_only type filter" {
+    const allocator = std.testing.allocator;
+
+    // Exclude + files_only filter
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .types = .files_only,
+        .exclude = &.{"**/*.zig"},
+    });
+    defer iter.deinit();
+
+    var found_zig = false;
+    var found_directory = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, ".zig")) {
+            found_zig = true;
+        }
+        if (entry.kind == .directory) {
+            found_directory = true;
+        }
+    }
+
+    // No .zig files should be found (excluded)
+    try std.testing.expect(!found_zig);
+    // No directories should be found (type filter)
+    try std.testing.expect(!found_directory);
+}
+
+test "exclude: interaction with directories_only type filter" {
+    const allocator = std.testing.allocator;
+
+    // Exclude + directories_only filter
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .types = .directories_only,
+        .exclude = &.{"**/compiler"}, // Exclude compiler directory
+    });
+    defer iter.deinit();
+
+    var found_compiler = false;
+    var found_file = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "compiler")) {
+            found_compiler = true;
+        }
+        if (entry.kind == .file) {
+            found_file = true;
+        }
+    }
+
+    // compiler directory should be excluded
+    try std.testing.expect(!found_compiler);
+    // No files should be found (type filter)
+    try std.testing.expect(!found_file);
+}
+
+test "exclude: interaction with max_depth" {
+    const allocator = std.testing.allocator;
+
+    // Exclude + max_depth
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .max_depth = 1,
+        .exclude = &.{"**/root.zig"},
+    });
+    defer iter.deinit();
+
+    var found_root = false;
+    var found_deep = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "root.zig")) {
+            found_root = true;
+        }
+        // Check for deeply nested files
+        var depth: usize = 0;
+        for (entry.path) |c| {
+            if (c == '/') depth += 1;
+        }
+        if (depth > 1) found_deep = true;
+    }
+
+    // root.zig should be excluded
+    try std.testing.expect(!found_root);
+    // Should not find files deeper than max_depth
+    try std.testing.expect(!found_deep);
+}
+
+// ============================================================================
+// Exclude Functionality Tests - Performance/Stress
+// ============================================================================
+
+test "exclude: many exclude patterns" {
+    const allocator = std.testing.allocator;
+
+    // Test with multiple exclude patterns
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{
+            "**/ast.zig",
+            "**/lexer.zig",
+            "**/parser.zig",
+            "**/brace.zig",
+            "**/validation.zig",
+            // Additional patterns that won't match anything
+            "**/nonexistent1.zig",
+            "**/nonexistent2.zig",
+            "**/nonexistent3.zig",
+            "**/nonexistent4.zig",
+            "**/nonexistent5.zig",
+        },
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    var found_lexer = false;
+    var found_parser = false;
+    var found_brace = false;
+    var found_validation = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) found_ast = true;
+        if (std.mem.endsWith(u8, entry.path, "lexer.zig")) found_lexer = true;
+        if (std.mem.endsWith(u8, entry.path, "parser.zig")) found_parser = true;
+        if (std.mem.endsWith(u8, entry.path, "brace.zig")) found_brace = true;
+        if (std.mem.endsWith(u8, entry.path, "validation.zig")) found_validation = true;
+    }
+
+    // All specified files should be excluded
+    try std.testing.expect(!found_ast);
+    try std.testing.expect(!found_lexer);
+    try std.testing.expect(!found_parser);
+    try std.testing.expect(!found_brace);
+    try std.testing.expect(!found_validation);
+}
+
+test "exclude: pattern requiring backtracking" {
+    const allocator = std.testing.allocator;
+
+    // Pattern with multiple wildcards that may require backtracking
+    var iter = try glob(allocator, &.{"src/**/*.zig"}, .{
+        .exclude = &.{"**/*a*r*.zig"}, // Matches parser.zig (p-a-r-ser)
+    });
+    defer iter.deinit();
+
+    var found_parser = false;
+    var found_lexer = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "parser.zig")) found_parser = true;
+        if (std.mem.endsWith(u8, entry.path, "lexer.zig")) found_lexer = true;
+    }
+
+    // parser.zig matches *a*r* pattern (p[a]rse[r].zig)
+    try std.testing.expect(!found_parser);
+    // lexer.zig does not match (no 'a' before 'r')
+    try std.testing.expect(found_lexer);
+}
+
+test "exclude: overlapping exclude patterns" {
+    const allocator = std.testing.allocator;
+
+    // Multiple patterns that overlap in what they exclude
+    var iter = try glob(allocator, &.{"src/**/*.zig"}, .{
+        .exclude = &.{
+            "**/*.zig", // Excludes all .zig
+            "**/ast.zig", // Also excludes ast.zig (redundant)
+            "**/parser.zig", // Also excludes parser.zig (redundant)
+        },
+    });
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        count += 1;
+    }
+
+    // All .zig files should be excluded
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "exclude: globstar exclude in deep directory" {
+    const allocator = std.testing.allocator;
+
+    // Exclude specific directory at any depth
+    var iter = try glob(allocator, &.{"src/**/*"}, .{
+        .exclude = &.{"**/compiler/**"},
+    });
+    defer iter.deinit();
+
+    var found_compiler_file = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.indexOf(u8, entry.path, "compiler/") != null) {
+            found_compiler_file = true;
+        }
+    }
+
+    // Nothing inside compiler/ should be found
+    try std.testing.expect(!found_compiler_file);
+}
+
+test "exclude: exclude with exact path match" {
+    const allocator = std.testing.allocator;
+
+    // Test exact path exclude (no wildcards in exclude)
+    var iter = try glob(allocator, &.{"src/*.zig"}, .{
+        .exclude = &.{"src/root.zig"}, // Exact path
+    });
+    defer iter.deinit();
+
+    var found_root = false;
+    var found_other = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.eql(u8, entry.path, "src/root.zig")) {
+            found_root = true;
+        } else {
+            found_other = true;
+        }
+    }
+
+    // root.zig should be excluded
+    try std.testing.expect(!found_root);
+    // Other files should still be found
+    try std.testing.expect(found_other);
+}
+
+test "exclude: exclude preserves order of remaining matches" {
+    const allocator = std.testing.allocator;
+
+    // Verify that excluding some files doesn't break iteration
+    var iter = try glob(allocator, &.{"src/compiler/*.zig"}, .{
+        .exclude = &.{"**/ast.zig"},
+    });
+    defer iter.deinit();
+
+    var paths = std.array_list.AlignedManaged([]const u8, null).init(allocator);
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit();
+    }
+
+    while (try iter.next()) |entry| {
+        try paths.append(try allocator.dupe(u8, entry.path));
+        allocator.free(entry.path);
+    }
+
+    // Should have found some files
+    try std.testing.expect(paths.items.len > 0);
+
+    // Verify ast.zig is not in results
+    for (paths.items) |p| {
+        try std.testing.expect(!std.mem.endsWith(u8, p, "ast.zig"));
+    }
+}
+
+test "exclude: exclude with mixed slash styles" {
+    const allocator = std.testing.allocator;
+
+    // Test that exclude works with forward slashes (Unix-style)
+    var iter = try glob(allocator, &.{"src/**/*.zig"}, .{
+        .exclude = &.{"src/compiler/ast.zig"}, // Forward slashes
+    });
+    defer iter.deinit();
+
+    var found_ast = false;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.path);
+        if (std.mem.endsWith(u8, entry.path, "ast.zig")) {
+            found_ast = true;
+        }
+    }
+
+    // ast.zig should be excluded
+    try std.testing.expect(!found_ast);
 }
 
 // Run all submodule tests
